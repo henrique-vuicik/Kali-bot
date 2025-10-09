@@ -1,140 +1,126 @@
-// index.js
 const express = require("express");
 const axios = require("axios");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// Porta (Railway define PORT)
 const PORT = process.env.PORT || 8080;
 
-// Tenta várias chaves de ambiente possíveis para o token 360
-function getD360Token() {
-  return (
-    process.env.D360_API_KEY ||
-    process.env.D360_API_TOKEN ||
-    process.env.D360_API ||
-    process.env.DIALOG360_API_KEY ||
-    process.env.DIALOG360_TOKEN
-  );
-}
+// pega o token da 360 de qualquer nome que vc tenha usado
+const getD360 = () =>
+  process.env.D360_API_KEY ||
+  process.env.D360_API_TOKEN ||
+  process.env.D360_API ||
+  process.env.DIALOG360_API_KEY ||
+  process.env.DIALOG360_TOKEN ||
+  process.env.D360;
 
-// Extrai com segurança o "value" da mudança
-function getChangeValue(body) {
+// helpers
+const changeValue = (b) => {
   try {
-    const entry = body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    // Alguns payloads já trazem o objeto direto em "value"
-    return change?.value ?? change;
+    const e = b?.entry?.[0];
+    const c = e?.changes?.[0];
+    return c?.value ?? c;
   } catch {
     return undefined;
   }
-}
+};
 
-// Extrai o número do remetente de forma resiliente
-function extractSenderNumber(body) {
-  const value = getChangeValue(body);
-  if (!value) return null;
+const pickText = (b) => {
+  const v = changeValue(b);
+  const m = v?.messages?.[0];
+  if (!m) return null;
 
-  // 1) Mensagens comuns
-  const msg = Array.isArray(value.messages) ? value.messages[0] : undefined;
-  if (msg?.from) return String(msg.from).trim();
+  if (m.text?.body) return m.text.body;
+  if (m.button?.text) return m.button.text;
 
-  // 2) Contatos (quando não vem em messages)
-  const contact = Array.isArray(value.contacts) ? value.contacts[0] : undefined;
-  if (contact?.wa_id) return String(contact.wa_id).trim();
-
-  // 3) Status (entregas/leitura): recipient_id
-  const status = Array.isArray(value.statuses) ? value.statuses[0] : undefined;
-  if (status?.recipient_id) return String(status.recipient_id).trim();
-
-  return null;
-}
-
-// Extrai texto útil (quando houver)
-function extractMessageText(body) {
-  const value = getChangeValue(body);
-  const msg = Array.isArray(value?.messages) ? value.messages[0] : undefined;
-  if (!msg) return null;
-
-  if (msg.text?.body) return msg.text.body;
-  if (msg.button?.text) return msg.button.text;
-
-  // Interactives
-  const i = msg.interactive;
+  const i = m.interactive;
   if (i?.button_reply?.title) return i.button_reply.title;
   if (i?.list_reply?.title) return i.list_reply.title;
 
   return null;
-}
+};
 
-// Envia uma resposta simples via 360dialog (opcional)
-async function replyVia360(to, text) {
-  const token = getD360Token();
+const pickNumber = (b) => {
+  const v = changeValue(b);
+
+  // caminhos “certos”
+  const m = v?.messages?.[0];
+  if (m?.from) return String(m.from).trim();
+
+  const c = v?.contacts?.[0];
+  if (c?.wa_id) return String(c.wa_id).trim();
+
+  const s = v?.statuses?.[0];
+  if (s?.recipient_id) return String(s.recipient_id).trim();
+
+  // Fallback bruto (regex) no JSON inteiro
+  const raw = JSON.stringify(b);
+  // tenta nas chaves conhecidas
+  let hit =
+    raw.match(/"wa_id"\s*:\s*"(\d{6,20})"/) ||
+    raw.match(/"from"\s*:\s*"(\d{6,20})"/) ||
+    raw.match(/"recipient_id"\s*:\s*"(\d{6,20})"/);
+
+  if (hit?.[1]) return hit[1];
+
+  // último recurso: QUALQUER sequência longa de dígitos
+  hit = raw.match(/"(\d{6,20})"/);
+  if (hit?.[1]) return hit[1];
+
+  return null;
+};
+
+async function reply360(to, text) {
+  const token = getD360();
   if (!token) {
     console.log("⚠️ D360 token ausente nas variáveis de ambiente.");
     return;
   }
-
   try {
     await axios.post(
       "https://waba.360dialog.io/v1/messages",
-      {
-        to,
-        type: "text",
-        text: { body: text },
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "D360-API-KEY": token,
-        },
-        timeout: 10000,
-      }
+      { to, type: "text", text: { body: text } },
+      { headers: { "Content-Type": "application/json", "D360-API-KEY": token }, timeout: 10000 }
     );
-    console.log(`✅ Resposta enviada para ${to}`);
+    console.log(`✅ enviado p/ ${to}`);
   } catch (err) {
-    const msg = err?.response?.data || err.message;
-    console.error("❌ Erro ao responder via 360:", msg);
+    console.error("❌ erro 360:", err?.response?.data || err.message);
   }
 }
 
-// Webhook POST (recebe eventos)
 app.post("/webhook", async (req, res) => {
+  // LOGS que precisamos ver no Railway
+  const raw = JSON.stringify(req.body);
+  console.log(
+    `📩 incoming flags -> msgs:${/"messages"\s*:\s*\[/.test(raw)} contacts:${/"contacts"\s*:\s*\[/.test(raw)} statuses:${/"statuses"\s*:\s*\[/.test(raw)}`
+  );
+  console.log(`🔎 raw(0..400): ${raw.slice(0, 400)}…`);
+
+  let number = null;
+  let text = null;
   try {
-    // Log resumido do incoming
-    console.log("📩 incoming:", JSON.stringify(req.body).slice(0, 2000));
-
-    const number = extractSenderNumber(req.body);
-    const text = extractMessageText(req.body);
-
-    if (!number) {
-      console.error("❌ Nenhum número encontrado");
-      // Sempre responder 200 para o WhatsApp não repetir
-      return res.status(200).send("ok");
-    }
-
-    console.log(`👤 Número detectado: ${number}${text ? " | texto: " + text : ""}`);
-
-    // Resposta opcional automática (comente se não quiser)
-    if (text) {
-      await replyVia360(number, "Recebi sua mensagem 👍");
-    }
-
-    return res.status(200).send("ok");
+    number = pickNumber(req.body);
+    text = pickText(req.body);
   } catch (e) {
-    console.error("🔥 Erro no webhook:", e);
-    // Ainda assim devolve 200 para evitar reenvio em loop
+    console.error("parser error:", e);
+  }
+
+  if (!number) {
+    console.error("❌ Nenhum número encontrado (com fallback agressivo)");
     return res.status(200).send("ok");
   }
+
+  console.log(`👤 numero=${number}${text ? " | texto=" + JSON.stringify(text) : ""}`);
+
+  if (text) {
+    await reply360(number, "Recebi sua mensagem 👍");
+  }
+
+  return res.status(200).send("ok");
 });
 
-// (Opcional) Verificação GET do webhook para Cloud API / 360dialog se você usa challenge
-app.get("/webhook", (req, res) => {
-  // Ajuste conforme sua verificação; por padrão apenas responde 200
-  res.status(200).send("ok");
-});
+// verificação simples
+app.get("/webhook", (_req, res) => res.status(200).send("ok"));
 
-app.listen(PORT, () => {
-  console.log(`🚀 Kali server listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 Kali server listening on :${PORT}`));
