@@ -4,90 +4,52 @@ import morgan from "morgan";
 import cors from "cors";
 
 const app = express();
+app.use(express.json());
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
-app.use(morgan("tiny"));
+app.use(morgan("dev"));
 
-const PORT = process.env.PORT || 3000;
-const D360_API_KEY = process.env.D360_API_KEY;              // VARIÁVEL NO RAILWAY
-const D360_SEND_URL = "https://waba-v2.360dialog.io/v1/messages"; // v2 para Cloud API
+const PORT = process.env.PORT || 8080;
+const D360_API_KEY = process.env.D360_API_KEY;
+const D360_SEND_URL = "https://waba-v2.360dialog.io/v1/messages";
 
-// --- rotas de saúde ---
-app.get("/", (_req, res) => res.send("ok"));
-app.get("/health", (_req, res) => res.send("ok"));
+app.get("/health", (req, res) => res.send("ok"));
 
-// --- helper: enviar texto ---
-async function sendText(to, body) {
-  try {
-    const { data } = await axios.post(
-      D360_SEND_URL,
-      {
-        messaging_product: "whatsapp",
-        to,                      // wa_id sem "+" (a 360 já manda assim)
-        type: "text",
-        text: { body, preview_url: false }
-      },
-      {
-        headers: {
-          "D360-API-KEY": D360_API_KEY,
-          "Content-Type": "application/json"
-        },
-        timeout: 15000
-      }
-    );
-    console.log("✅ sendText ok:", JSON.stringify(data));
-  } catch (err) {
-    const e = err?.response?.data || err.message;
-    console.error("❌ sendText error:", e);
-  }
-}
-
-// --- webhook principal (360 -> aqui) ---
+// Recebe mensagens do WhatsApp
 app.post("/webhook", async (req, res) => {
-  // responda 200 imediatamente para não dar timeout no provedor
-  res.sendStatus(200);
-
   try {
-    const payload = req.body;
-    console.log("📩 incoming:", JSON.stringify(payload));
+    const data = req.body;
 
-    // formato comum da 360/Cloud API:
-    // { contacts: [{ wa_id }], messages: [{ from, type, text: { body } , ...}] }
-    const msg = payload?.messages?.[0];
-    if (!msg) return;
+    console.log("📩 incoming:", JSON.stringify(data, null, 2));
 
-    // número do usuário (wa_id sem +)
-    const from =
-      payload?.contacts?.[0]?.wa_id ||
-      msg?.from ||
-      msg?.source?.wa_id ||
-      null;
+    // Identifica o número e a mensagem recebida
+    const from = data?.contacts?.[0]?.wa_id || data?.messages?.[0]?.from;
+    const msg = data?.messages?.[0]?.text?.body || "";
 
     if (!from) {
-      console.warn("⚠️ sem 'from/wa_id' no payload");
-      return;
+      console.log("❌ Nenhum número encontrado");
+      return res.sendStatus(200);
     }
 
-    // tipos básicos
-    if (msg.type === "text") {
-      const userText = (msg.text?.body || "").trim();
+    // Resposta padrão
+    const reply = {
+      messaging_product: "whatsapp",
+      to: from,
+      type: "text",
+      text: {
+        body: `Olá! Sou a assistente virtual Kali 🤖\n\nRecebi sua mensagem: "${msg}".\nComo posso ajudar você hoje?`,
+      },
+    };
 
-      // resposta simples/MVP
-      let reply =
-        "Oi! Eu sou a Kali 👋, assistente do Dr. Henrique. Posso ajudar com (1) agendamento, (2) check-in semanal ou (3) dúvidas rápidas.";
-      if (/^(oi|olá|ola|bom dia|boa tarde|boa noite)\b/i.test(userText)) {
-        reply =
-          "Bem-vindo(a)! Quer começar por (1) agendar, (2) check-in semanal ou (3) saber como funciona o acompanhamento?";
-      }
+    // Envia via 360dialog API
+    const response = await axios.post(D360_SEND_URL, reply, {
+      headers: { "D360-API-KEY": D360_API_KEY },
+    });
 
-      await sendText(from, reply);
-    } else if (msg.type === "image") {
-      await sendText(from, "Recebi sua imagem 📷. Em breve consigo analisá-la!");
-    } else {
-      await sendText(from, "Mensagem recebida ✅");
-    }
-  } catch (e) {
-    console.error("❌ webhook handler error:", e?.message || e);
+    console.log("✅ sendText ok:", response.data);
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("❌ sendText error:", error.response?.data || error.message);
+    res.sendStatus(200);
   }
 });
 
