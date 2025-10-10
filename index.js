@@ -1,81 +1,84 @@
-// index.js - integração mínima 360Dialog + Railway
 import express from "express";
 
 const app = express();
 app.use(express.json());
 
-// 🔧 Variáveis de ambiente
-const PORT = process.env.PORT || 8080;
-const D360_BASE = (process.env.D360_BASE || "https://waba-v2.360dialog.io").replace(/\/+$/, "");
-const D360_API_KEY = process.env.D360_API_KEY;
-const WABA_ID = process.env.WABA_ID;
-const FROM_NUMBER = process.env.FROM_NUMBER;
+const {
+  API_KEY,
+  BASE_URL = "https://waba-v2.360dialog.io",
+  PHONE_NUMBER_ID,
+  FROM_NUMBER,
+  PORT = 8080,
+} = process.env;
 
-// 🚀 Rota principal
-app.get("/", (_req, res) => res.status(200).send("✅ Kali bot online!"));
+app.get("/", (_req, res) => res.send("ok"));
 
-// 📩 Webhook do 360
 app.post("/webhook", async (req, res) => {
   try {
-    const body = req.body || {};
-    const change = body.entry?.[0]?.changes?.[0]?.value;
-    const msg = change?.messages?.[0];
-    const from = msg?.from;
-    const text = msg?.text?.body;
+    // 360 manda em dois formatos. Vamos ler os dois.
+    let from, text;
+
+    // Formato Cloud API (entry -> changes)
+    if (req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
+      const msg = req.body.entry[0].changes[0].value.messages[0];
+      from = msg.from;
+      text = msg.text?.body || msg.button?.text || msg.interactive?.text?.body;
+    }
+
+    // Formato sandbox/test da 360 (messages + contacts diretos)
+    if (!from && req.body?.messages?.[0]) {
+      const msg = req.body.messages[0];
+      from = msg.from || req.body.contacts?.[0]?.wa_id;
+      text = msg.text?.body;
+    }
 
     if (!from || !text) {
-      console.log("ℹ️ Payload recebido sem mensagem de texto.");
+      console.log("ℹ️ payload sem texto ou from. Ignorando.");
       return res.sendStatus(200);
     }
 
     console.log(`💬 msg de ${from}: "${text}"`);
 
-    if (!D360_API_KEY || !WABA_ID) {
-      console.error("❌ Faltam variáveis D360_API_KEY ou WABA_ID");
-      return res.sendStatus(500);
+    // Valida envs essenciais
+    if (!API_KEY || !PHONE_NUMBER_ID) {
+      console.error("🛑 Falta API_KEY ou PHONE_NUMBER_ID");
+      return res.sendStatus(200);
     }
 
-    // 🔗 Monta URL completa
-    const url = `${D360_BASE}/v1/messages`;
+    // Monta chamada no padrão Cloud API (v2 360dialog)
+    const url = `${BASE_URL}/v1/${PHONE_NUMBER_ID}/messages`;
 
-    // 📦 Payload correto conforme documentação 360Dialog
     const payload = {
-      from: WABA_ID,        // <-- ID do seu canal (não o número com DDI)
-      to: from,
+      messaging_product: "whatsapp",
+      to: from,                      // responde de volta pra quem enviou
       type: "text",
-      text: { body: `Recebi: ${text}` }
+      text: { body: `Echo: ${text}` }
     };
 
-    // 📤 Envia a resposta para o WhatsApp via 360
-    const response = await fetch(url, {
+    const r = await fetch(url, {
       method: "POST",
       headers: {
+        "Authorization": `Bearer ${API_KEY}`,
         "Content-Type": "application/json",
-        "D360-API-KEY": D360_API_KEY
+        "Accept": "application/json"
       },
       body: JSON.stringify(payload)
     });
 
-    const out = await response.text();
-
-    if (!response.ok) {
-      console.error(`🛑 360 erro: ${response.status} ${out}`);
+    const data = await r.text();
+    if (!r.ok) {
+      console.error("🛑 360 erro:", r.status, data);
     } else {
-      console.log(`✅ Enviado 360: ${out.slice(0, 200)}`);
+      console.log("✅ 360 ok:", data);
     }
 
     res.sendStatus(200);
-  } catch (err) {
-    console.error("❌ Erro ao processar mensagem:", err);
+  } catch (e) {
+    console.error("❌ Erro ao processar:", e);
     res.sendStatus(200);
   }
 });
 
-// 🧹 Encerramento limpo no Railway
-process.on("SIGTERM", () => {
-  console.log("🛑 SIGTERM — encerrando...");
-  process.exit(0);
+app.listen(PORT, () => {
+  console.log(`🚀 listening :${PORT}`);
 });
-
-// ▶️ Inicializa servidor
-app.listen(PORT, () => console.log(`🚀 listening :${PORT}`));
