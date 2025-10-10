@@ -1,94 +1,74 @@
+// index.js - 360 minimal echo
 import express from "express";
 
 const app = express();
 app.use(express.json());
 
-// ---- ENV ----
+// ENV
 const PORT = process.env.PORT || 8080;
+const D360_BASE = (process.env.D360_BASE || "https://waba-v2.360dialog.io").replace(/\/+$/,"");
+const D360_API_KEY = process.env.D360_API_KEY;
+const FROM_NUMBER = process.env.FROM_NUMBER;
 
-// Base da 360 (padrão v2)
-const D360_BASE = process.env.D360_BASE || "https://waba-v2.360dialog.io";
-const D360_API_KEY = process.env.D360_API_KEY;      // obrigatória
-const FROM_NUMBER = process.env.FROM_NUMBER;        // ex: 554291251751 (sem +)
+// ping
+app.get("/", (_req, res) => res.status(200).send("ok"));
 
-// Sanidade inicial
-if (!D360_API_KEY) {
-  console.warn("⚠️  D360_API_KEY não definida. Resposta não será enviada.");
-}
-if (!FROM_NUMBER) {
-  console.warn("⚠️  FROM_NUMBER não definido. Defina seu número WABA sem '+'.");
-}
-
-app.get("/health", (_req, res) => res.status(200).send("ok"));
-
-// Util: extrai texto + remetente do payload (360 -> formato Cloud API)
-function extractTextAndFrom(body) {
+// webhook 360
+app.post("/webhook", async (req, res) => {
   try {
-    if (!body || !body.entry || !Array.isArray(body.entry)) return null;
-    const change = body.entry[0]?.changes?.[0]?.value;
-    const msg = Array.isArray(change?.messages) ? change.messages[0] : null;
+    const body = req.body || {};
+    const change = body.entry?.[0]?.changes?.[0]?.value;
+    const msg = change?.messages?.[0];
     const from = msg?.from;
     const text = msg?.text?.body;
-    if (!from || !text) return null;
-    return { from, text };
-  } catch {
-    return null;
-  }
-}
 
-app.post("/webhook", async (req, res) => {
-  // Responde 200 primeiro para não tomar retry do 360
-  res.sendStatus(200);
+    if (!from || !text) {
+      console.log("ℹ️ payload sem texto ou sem from. Nada a fazer.");
+      return res.sendStatus(200);
+    }
 
-  const parsed = extractTextAndFrom(req.body);
-  if (!parsed) {
-    console.log("ℹ️ payload sem texto ou sem from. Nada a fazer.");
-    return;
-  }
+    console.log(`📥 msg de ${from}: "${text}"`);
 
-  const { from, text } = parsed;
-  console.log(`📥 msg de ${from}: "${text}"`);
+    if (!D360_API_KEY || !FROM_NUMBER) {
+      console.error("❌ Faltam envs D360_API_KEY ou FROM_NUMBER");
+      return res.sendStatus(500);
+    }
 
-  if (!D360_API_KEY || !FROM_NUMBER) {
-    console.log("⚠️ Sem credenciais FROM/API; pulando envio.");
-    return;
-  }
+    // URL COMPLETA (corrige ERR_INVALID_URL)
+    const url = `${D360_BASE}/v1/messages`;
 
-  // Mensagem de eco
-  const payload = {
-    from: FROM_NUMBER,          // seu número WABA
-    to: from,                   // quem te enviou
-    type: "text",
-    text: { body: `Recebido: ${text}` }
-  };
-
-  try {
-    const resp = await fetch(`${D360_BASE}/v1/messages`, {
+    const r = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         "D360-API-KEY": D360_API_KEY
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        from: FROM_NUMBER,
+        to: from,
+        type: "text",
+        text: { body: `Recebi: ${text}` }
+      })
     });
 
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) {
-      console.error("❌ Erro 360:", resp.status, data);
+    const out = await r.text();
+    if (!r.ok) {
+      console.error("🛑 360 erro:", r.status, out);
     } else {
-      console.log("✅ Enviado 360:", data);
+      console.log("✅ Enviado 360:", out.slice(0, 200));
     }
-  } catch (err) {
-    console.error("❌ Erro ao processar:", err);
+
+    res.sendStatus(200);
+  } catch (e) {
+    console.error("❌ Erro ao processar:", e);
+    res.sendStatus(200);
   }
 });
 
-// Shutdown gracioso (Railway)
+// graceful shutdown
 process.on("SIGTERM", () => {
   console.log("🛑 SIGTERM recebido (Railway redeploy). Encerrando...");
   process.exit(0);
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 listening :${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 listening :${PORT}`));
