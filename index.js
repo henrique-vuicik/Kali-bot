@@ -1,9 +1,13 @@
-const express = require("express");
-const axios = require("axios");
+// index.js (ESM)
+import express from "express";
+import axios from "axios";
+
+const app = express();
+app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 8080;
 
-// ===== helpers =====
+// pega o token da 360 em qualquer nome comum
 const getD360 = () =>
   process.env.D360_API_KEY ||
   process.env.D360_API_TOKEN ||
@@ -12,18 +16,18 @@ const getD360 = () =>
   process.env.DIALOG360_TOKEN ||
   process.env.D360;
 
-function changeValue(body) {
+const changeValue = (b) => {
   try {
-    const e = body?.entry?.[0];
+    const e = b?.entry?.[0];
     const c = e?.changes?.[0];
     return c?.value ?? c;
   } catch {
     return undefined;
   }
-}
+};
 
-function pickText(body) {
-  const v = changeValue(body);
+const pickText = (b) => {
+  const v = changeValue(b);
   const m = v?.messages?.[0];
   if (!m) return null;
   if (m.text?.body) return m.text.body;
@@ -32,10 +36,10 @@ function pickText(body) {
   if (i?.button_reply?.title) return i.button_reply.title;
   if (i?.list_reply?.title) return i.list_reply.title;
   return null;
-}
+};
 
-function pickNumber(body) {
-  const v = changeValue(body);
+const pickNumber = (b) => {
+  const v = changeValue(b);
   const m = v?.messages?.[0];
   if (m?.from) return String(m.from).trim();
   const c = v?.contacts?.[0];
@@ -43,8 +47,8 @@ function pickNumber(body) {
   const s = v?.statuses?.[0];
   if (s?.recipient_id) return String(s.recipient_id).trim();
 
-  // fallback bruto no JSON inteiro
-  const raw = JSON.stringify(body);
+  // Fallback bruto no JSON
+  const raw = JSON.stringify(b);
   let hit =
     raw.match(/"wa_id"\s*:\s*"(\d{6,20})"/) ||
     raw.match(/"from"\s*:\s*"(\d{6,20})"/) ||
@@ -55,7 +59,7 @@ function pickNumber(body) {
   if (hit?.[1]) return hit[1];
 
   return null;
-}
+};
 
 async function reply360(to, text) {
   const token = getD360();
@@ -75,82 +79,40 @@ async function reply360(to, text) {
   }
 }
 
-// ===== app =====
-const app = express();
-
-// coletor de corpo cru (qualquer content-type)
-app.use((req, res, next) => {
-  let chunks = [];
-  req.on("data", (c) => chunks.push(c));
-  req.on("end", () => {
-    const buf = Buffer.concat(chunks);
-    req.rawBody = buf.toString("utf8");
-    try {
-      if (req.rawBody && req.headers["content-type"]?.includes("application/json")) {
-        req.body = JSON.parse(req.rawBody);
-      }
-    } catch {
-      // deixa sem body se não for JSON válido
-    }
-    next();
-  });
-});
-
-// log global de TODA request
-app.use((req, _res, next) => {
-  const h = req.headers || {};
-  const keyHdrs = {
-    "x-forwarded-for": h["x-forwarded-for"],
-    "content-type": h["content-type"],
-    "user-agent": h["user-agent"]
-  };
-  const raw = req.rawBody || "";
-  console.log(
-    `📥 ${req.method} ${req.path} | hdrs=${JSON.stringify(keyHdrs)} | raw(0..800)= ${raw.slice(
-      0,
-      800
-    )}${raw.length > 800 ? "…" : ""}`
-  );
-  next();
-});
-
-// health/simple
+// Health
 app.get("/", (_req, res) => res.status(200).send("ok"));
-app.get("/webhook", (_req, res) => res.status(200).send("ok"));
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// webhook principal
+// Webhook
 app.post("/webhook", async (req, res) => {
-  const body = req.body ?? {};
-  console.log(
-    `🔎 flags -> msgs:${/"messages"\s*:\s*\[/.test(JSON.stringify(body))} contacts:${/"contacts"\s*:\s*\[/.test(
-      JSON.stringify(body)
-    )} statuses:${/"statuses"\s*:\s*\[/.test(JSON.stringify(body))}`
-  );
-
-  let number = null;
-  let text = null;
   try {
-    number = pickNumber(body);
-    text = pickText(body);
-  } catch (e) {
-    console.log("parser error:", e?.message || e);
-  }
+    const raw = JSON.stringify(req.body);
+    console.log(
+      `📥 POST /webhook | flags msgs:${/"messages"\s*:\s*\[/.test(raw)} contacts:${/"contacts"\s*:\s*\[/.test(
+        raw
+      )} statuses:${/"statuses"\s*:\s*\[/.test(raw)}`
+    );
+    console.log(`🔎 raw(0..400): ${raw.slice(0, 400)}${raw.length > 400 ? "…" : ""}`);
 
-  if (!number) {
-    console.log("❌ Nenhum número encontrado (mesmo após fallback)");
+    const number = pickNumber(req.body);
+    const text = pickText(req.body);
+
+    if (!number) {
+      console.log("❌ Nenhum número encontrado");
+      return res.status(200).send("ok");
+    }
+
+    console.log(`👤 numero=${number}${text ? " | texto=" + JSON.stringify(text) : ""}`);
+
+    if (text) {
+      await reply360(number, `Recebi: ${text}`);
+    }
+
+    return res.status(200).send("ok");
+  } catch (e) {
+    console.log("💥 erro handler:", e?.message || e);
     return res.status(200).send("ok");
   }
-
-  console.log(`👤 numero=${number}${text ? " | texto=" + JSON.stringify(text) : ""}`);
-
-  if (text) {
-    await reply360(number, "Recebi sua mensagem 👍");
-  }
-
-  return res.status(200).send("ok");
 });
-
-// pega qq rota p/ garantir log mesmo se URL estiver errada
-app.all("*", (_req, res) => res.status(200).send("ok"));
 
 app.listen(PORT, () => console.log(`🚀 Kali server listening on :${PORT}`));
