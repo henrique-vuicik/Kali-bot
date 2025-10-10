@@ -1,112 +1,80 @@
-// index.js
+// index.js — ultra simples, só 360
 import express from "express";
 
-// ----- Config -----
-const PORT = process.env.PORT || 8080;
-const D360_API_KEY = process.env.D360_API_KEY; // OBRIGATÓRIA
-const D360_BASE = (process.env.D360_BASE || "https://waba.360dialog.io").replace(/\/+$/, "");
-
-// Util: log compacto
-const j = (obj, n = 400) => JSON.stringify(obj || "").slice(0, n);
-
-// ----- App -----
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json());
 
-// Healthcheck
-app.get("/", (_req, res) => res.status(200).send("OK"));
+// variáveis de ambiente necessárias
+const {
+  D360_API_KEY = "",
+  D360_BASE = "https://waba-v2.360dialog.io", // v2 da 360
+  D360_FROM = "", // seu número remetente no formato E.164 sem +, ex: 554291251751
+  PORT = 8080
+} = process.env;
 
-// Webhook do 360
+app.get("/", (_, res) => res.status(200).send("ok"));
+
 app.post("/webhook", async (req, res) => {
+  // sempre responda 200 rápido ao 360
+  res.sendStatus(200);
+
   try {
+    // tente extrair texto e número do payload (Cloud/Meta ou 360)
     const body = req.body || {};
-    // 1) Responder 200 o mais rápido possível
-    res.sendStatus(200);
+    let texto = "";
+    let to = "";
 
-    // 2) Logs úteis
-    console.log("📥 POST /webhook | flags",
-      `msgs:${!!body?.entry?.[0]?.changes?.[0]?.value?.messages}`,
-      `contacts:${!!body?.entry?.[0]?.changes?.[0]?.value?.contacts}`,
-      `statuses:${!!body?.entry?.[0]?.changes?.[0]?.value?.statuses}`
-    );
-    console.log("🔎 raw(0..400):", j(body));
+    // Cloud API formato (o que aparece nos seus logs)
+    if (body.object === "whatsapp_business_account") {
+      const change = body.entry?.[0]?.changes?.[0]?.value;
+      texto = change?.messages?.[0]?.text?.body || "";
+      to = change?.messages?.[0]?.from || "";
+    }
 
-    // 3) Extrair mensagem de texto
-    const value = body?.entry?.[0]?.changes?.[0]?.value;
-    const msg = value?.messages?.[0];
-    const from = msg?.from;            // ex: "554299401345"
-    const text = msg?.text?.body?.trim();
+    // 360 mock/test também pode mandar em body.messages[0]
+    if (!texto && body?.messages?.[0]?.text?.body) {
+      texto = body.messages[0].text.body;
+      to = body.messages[0].from || "";
+    }
 
-    if (!from || !text) {
+    if (!texto || !to) {
       console.log("ℹ️ payload sem texto ou sem from. Nada a fazer.");
       return;
     }
 
-    console.log(`👤 numero=${from} | texto=${JSON.stringify(text)}`);
+    console.log(`📥 msg de ${to}: "${texto}"`);
 
-    if (!D360_API_KEY) {
-      console.log("⚠️ D360_API_KEY ausente. Não consigo responder.");
-      return;
-    }
-
-    // 4) Formar corpo padrão
-    const payload = {
-      to: from,
-      recipient_type: "individual",
-      type: "text",
-      text: { body: `Você disse: "${text}"` } // Efeito "eco" para validação
-    };
-
-    // 5) Tenta v2, se falhar cai pra v1
-    const ok = await send360(`${D360_BASE}/v2/messages`, payload, "v2")
-          || await send360(`${D360_BASE}/v1/messages`, payload, "v1");
-
-    if (ok) {
-      console.log("✅ resposta enviada com sucesso.");
-    } else {
-      console.log("❌ Todas as tentativas falharam.");
-    }
-  } catch (err) {
-    console.error("💥 erro no webhook:", err);
-    // (já respondemos 200, então só loga)
-  }
-});
-
-// Start
-app.listen(PORT, () => console.log(`🚀 listening :${PORT}`));
-
-// Graceful shutdown (Railway manda SIGTERM em cada redeploy)
-process.on("SIGTERM", () => {
-  console.log("🛑 SIGTERM recebido (Railway redeploy). Encerrando...");
-  process.exit(0);
-});
-
-// ----- Helpers -----
-async function send360(url, body, label) {
-  try {
-    const r = await fetch(url, {
+    // resposta eco via 360 (sessão)
+    const resp = await fetch(`${D360_BASE}/v1/messages`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "D360-API-KEY": D360_API_KEY
+        "D360-API-KEY": D360_API_KEY.trim()
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify({
+        // incluir 'from' ajuda em alguns canais multi-tenant da 360
+        from: D360_FROM || undefined,
+        to,
+        type: "text",
+        text: { body: `Você disse: ${texto}` }
+      })
     });
 
-    if (r.ok) {
-      console.log(`📤 ${label} OK ${r.status}`);
-      return true;
+    const out = await resp.text();
+    if (!resp.ok) {
+      console.log("🛑 360 respondeu erro:", resp.status, out);
+    } else {
+      console.log("✅ 360 OK:", out.slice(0, 300));
     }
-
-    // 360 costuma retornar JSON com { meta: { success, http_code, developer_message, 360dialog_trace_id } }
-    let data = null;
-    try { data = await r.json(); } catch {}
-    console.log(`🛑 360 ${label} erro: ${r.status}`, data || await r.text());
-    // se v2 deu 400/555, deixa o caller tentar v1
-    if (label === "v2" && (r.status === 400 || r.status === 555)) return false;
-    return false;
   } catch (e) {
-    console.log(`🛑 falha de rede no ${label}:`, e?.message || e);
-    return false;
+    console.error("❌ Erro ao processar:", e);
   }
-}
+});
+
+// encerrar limpo no Railway
+process.on("SIGTERM", () => {
+  console.log("🛑 SIGTERM — encerrando...");
+  process.exit(0);
+});
+
+app.listen(PORT, () => console.log(`🚀 listening :${PORT}`));
