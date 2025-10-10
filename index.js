@@ -1,140 +1,112 @@
+// index.js
 import express from "express";
-import axios from "axios";
 
+// ----- Config -----
+const PORT = process.env.PORT || 8080;
+const D360_API_KEY = process.env.D360_API_KEY; // OBRIGATÓRIA
+const D360_BASE = (process.env.D360_BASE || "https://waba.360dialog.io").replace(/\/+$/, "");
+
+// Util: log compacto
+const j = (obj, n = 400) => JSON.stringify(obj || "").slice(0, n);
+
+// ----- App -----
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-// ✅ Healthcheck (Railway não mata o container)
-app.get("/", (_req, res) => {
-  res.status(200).send("ok");
-});
+// Healthcheck
+app.get("/", (_req, res) => res.status(200).send("OK"));
 
+// Webhook do 360
 app.post("/webhook", async (req, res) => {
   try {
-    const body = req.body;
-    console.log("📥 POST /webhook | flags msgs:%s contacts:%s statuses:%s",
-      !!body.entry?.[0]?.changes?.[0]?.value?.messages,
-      !!body.entry?.[0]?.changes?.[0]?.value?.contacts,
-      !!body.entry?.[0]?.changes?.[0]?.value?.statuses
+    const body = req.body || {};
+    // 1) Responder 200 o mais rápido possível
+    res.sendStatus(200);
+
+    // 2) Logs úteis
+    console.log("📥 POST /webhook | flags",
+      `msgs:${!!body?.entry?.[0]?.changes?.[0]?.value?.messages}`,
+      `contacts:${!!body?.entry?.[0]?.changes?.[0]?.value?.contacts}`,
+      `statuses:${!!body?.entry?.[0]?.changes?.[0]?.value?.statuses}`
     );
+    console.log("🔎 raw(0..400):", j(body));
 
-    const change = body.entry?.[0]?.changes?.[0];
-    const value = change?.value;
-    const message = value?.messages?.[0];
-    const contact = value?.contacts?.[0];
+    // 3) Extrair mensagem de texto
+    const value = body?.entry?.[0]?.changes?.[0]?.value;
+    const msg = value?.messages?.[0];
+    const from = msg?.from;            // ex: "554299401345"
+    const text = msg?.text?.body?.trim();
 
-    if (!message || !contact) {
-      res.sendStatus(200);
+    if (!from || !text) {
+      console.log("ℹ️ payload sem texto ou sem from. Nada a fazer.");
       return;
     }
 
-    const texto = message.text?.body?.trim();
-    const numero = contact.wa_id;
+    console.log(`👤 numero=${from} | texto=${JSON.stringify(text)}`);
 
-    console.log(`👤 numero=${numero} | texto="${texto}"`);
-
-    // texto de resposta simples
-    const resposta = `Olá, ${contact.profile?.name || ""}! 👋
-Recebi sua mensagem: "${texto}"`;
-
-    // --- 1️⃣ Envio pela 360dialog
-    const d360ApiKey = process.env.D360_API_KEY;
-    let enviado = false;
-
-    if (d360ApiKey) {
-      try {
-        const payload = {
-          to: numero,
-          type: "text",
-          text: { body: resposta },
-        };
-
-        // nova API v2
-        await axios.post("https://waba.360dialog.io/v2/messages", payload, {
-          headers: {
-            "D360-API-KEY": d360ApiKey,
-            "Content-Type": "application/json",
-          },
-        });
-
-        enviado = true;
-        console.log("✅ Enviado pela 360 v2");
-      } catch (err) {
-        const code = err.response?.status || "??";
-        console.log(`🛑 360 v2 erro: ${code}`, err.response?.data || err.message);
-
-        // tenta fallback v1
-        try {
-          await axios.post("https://waba.360dialog.io/v1/messages", {
-            to: numero,
-            type: "text",
-            text: { body: resposta },
-          }, {
-            headers: {
-              "D360-API-KEY": d360ApiKey,
-              "Content-Type": "application/json",
-            },
-          });
-
-          enviado = true;
-          console.log("✅ Enviado pela 360 v1");
-        } catch (err2) {
-          console.log("🛑 360 v1 erro:", err2.response?.status, err2.response?.data || err2.message);
-        }
-      }
+    if (!D360_API_KEY) {
+      console.log("⚠️ D360_API_KEY ausente. Não consigo responder.");
+      return;
     }
 
-    // --- 2️⃣ Fallback via Cloud API da Meta
-    if (!enviado) {
-      const token = process.env.WHATSAPP_TOKEN;
-      const phoneId = process.env.CLOUD_PHONE_NUMBER_ID || value?.metadata?.phone_number_id;
+    // 4) Formar corpo padrão
+    const payload = {
+      to: from,
+      recipient_type: "individual",
+      type: "text",
+      text: { body: `Você disse: "${text}"` } // Efeito "eco" para validação
+    };
 
-      if (token && phoneId) {
-        try {
-          await axios.post(
-            `https://graph.facebook.com/v20.0/${phoneId}/messages`,
-            {
-              messaging_product: "whatsapp",
-              to: numero,
-              type: "text",
-              text: { body: resposta },
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "application/json",
-              },
-            }
-          );
+    // 5) Tenta v2, se falhar cai pra v1
+    const ok = await send360(`${D360_BASE}/v2/messages`, payload, "v2")
+          || await send360(`${D360_BASE}/v1/messages`, payload, "v1");
 
-          enviado = true;
-          console.log("✅ Enviado via Cloud API");
-        } catch (err3) {
-          console.log("🛑 Cloud API erro:", err3.response?.status, err3.response?.data || err3.message);
-        }
-      } else {
-        console.log("ℹ️ Cloud API fallback indisponível (sem WHATSAPP_TOKEN/phoneNumberId).");
-      }
+    if (ok) {
+      console.log("✅ resposta enviada com sucesso.");
+    } else {
+      console.log("❌ Todas as tentativas falharam.");
     }
-
-    if (!enviado) console.log("❌ Todas as tentativas falharam.");
-    res.sendStatus(200);
-
   } catch (err) {
-    console.error("❌ Erro no webhook:", err);
-    res.sendStatus(500);
+    console.error("💥 erro no webhook:", err);
+    // (já respondemos 200, então só loga)
   }
 });
 
-// ✅ Handlers de encerramento para debug
+// Start
+app.listen(PORT, () => console.log(`🚀 listening :${PORT}`));
+
+// Graceful shutdown (Railway manda SIGTERM em cada redeploy)
 process.on("SIGTERM", () => {
   console.log("🛑 SIGTERM recebido (Railway redeploy). Encerrando...");
   process.exit(0);
 });
-process.on("SIGINT", () => {
-  console.log("🛑 SIGINT (interrompido manualmente).");
-  process.exit(0);
-});
 
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, "0.0.0.0", () => console.log(`🚀 listening :${PORT}`));
+// ----- Helpers -----
+async function send360(url, body, label) {
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "D360-API-KEY": D360_API_KEY
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (r.ok) {
+      console.log(`📤 ${label} OK ${r.status}`);
+      return true;
+    }
+
+    // 360 costuma retornar JSON com { meta: { success, http_code, developer_message, 360dialog_trace_id } }
+    let data = null;
+    try { data = await r.json(); } catch {}
+    console.log(`🛑 360 ${label} erro: ${r.status}`, data || await r.text());
+    // se v2 deu 400/555, deixa o caller tentar v1
+    if (label === "v2" && (r.status === 400 || r.status === 555)) return false;
+    return false;
+  } catch (e) {
+    console.log(`🛑 falha de rede no ${label}:`, e?.message || e);
+    return false;
+  }
+}
