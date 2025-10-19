@@ -1,131 +1,105 @@
-// index.js — versão final (Cloud API v2 360dialog)
-// Corrigido para usar o endpoint: https://waba-v2.360dialog.io/v1/{PHONE_NUMBER_ID}/messages
+// index.js — v2 360dialog com DEBUG detalhado
 
 import express from "express";
-
 const app = express();
 app.use(express.json());
 
-// ===== VARIÁVEIS DE AMBIENTE =====
-const D360_API_KEY     = process.env.D360_API_KEY || process.env.API_KEY || "";
-const BASE_URL         = (process.env.BASE_URL || "https://waba-v2.360dialog.io/").trim();
-const PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID || "";
-const PORT             = process.env.PORT || 8080;
+// ===== ENV =====
+const D360_API_KEY    = process.env.D360_API_KEY || process.env.API_KEY || "";
+const BASE_URL_RAW    = process.env.BASE_URL || "https://waba-v2.360dialog.io/";
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || "";
+const PORT            = process.env.PORT || 8080;
 
-// Normaliza BASE_URL (garante barra no final)
-const BASE = BASE_URL.endsWith("/") ? BASE_URL : BASE_URL + "/";
-
-// ✅ Endpoint correto (com número na URL)
+// normaliza BASE_URL
+const BASE = BASE_URL_RAW.endsWith("/") ? BASE_URL_RAW : BASE_URL_RAW + "/";
+// endpoint v2 correto
 const V2_SEND_URL = `${BASE}v1/${PHONE_NUMBER_ID}/messages`;
 
-// ===== FUNÇÃO AUXILIAR =====
-async function safeJson(resp) {
-  try { return await resp.json(); } catch { return await resp.text(); }
+// helpers
+async function safeJson(res) {
+  try { return await res.json(); } catch { try { return await res.text(); } catch { return null; } }
 }
-
-// ===== LOG SIMPLES =====
 const log = (lvl, msg, extra) => {
-  const tag = lvl === "err" ? "🟥" : "✅";
-  console.log(`${tag} ${msg}`, extra ? JSON.stringify(extra, null, 2) : "");
+  const tag = lvl === "err" ? "🟥" : lvl === "warn" ? "🟧" : lvl === "dbg" ? "🟦" : "🟩";
+  console.log(`${tag} ${msg}`, extra ? (typeof extra === "string" ? extra : JSON.stringify(extra, null, 2)) : "");
 };
 
-// ===== ROTA PRINCIPAL =====
+// health
 app.get("/", (_, res) => {
   res.json({
     ok: true,
-    version: "v2-final",
+    using_360_v2: true,
     BASE_URL: BASE,
-    PHONE_NUMBER_ID,
     has_API_KEY: !!D360_API_KEY,
+    PHONE_NUMBER_ID,
     PORT: String(PORT)
   });
 });
 
-// ===== ROTA DE TESTE DIRETO =====
-// Teste no navegador: /debug/send?to=554299401345&text=teste
+// debug manual: /debug/send?to=554299401345&text=Oi
 app.get("/debug/send", async (req, res) => {
   const to = (req.query.to || "").toString();
   const text = (req.query.text || "").toString();
+  if (!to || !text) return res.status(400).json({ ok:false, error:"Faltou 'to' ou 'text'" });
+  if (!D360_API_KEY || !PHONE_NUMBER_ID) return res.status(400).json({ ok:false, error:"Faltam envs (D360_API_KEY/PHONE_NUMBER_ID)" });
 
-  if (!to || !text) return res.status(400).json({ ok: false, error: "Faltou 'to' ou 'text'" });
-  if (!D360_API_KEY || !PHONE_NUMBER_ID) return res.status(400).json({ ok: false, error: "Faltam envs" });
-
-  const payload = {
-    messaging_product: "whatsapp",
-    to,
-    type: "text",
-    text: { body: text }
-  };
+  const payload = { messaging_product:"whatsapp", to, type:"text", text:{ body:text } };
+  const headers = { "Content-Type":"application/json", "D360-API-KEY": D360_API_KEY };
 
   try {
-    const r = await fetch(V2_SEND_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "D360-API-KEY": D360_API_KEY
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const data = await safeJson(r);
+    log("dbg", "360 REQUEST", { url: V2_SEND_URL, headers: { ...headers, "D360-API-KEY":"<hidden>" }, payload });
+    const r = await fetch(V2_SEND_URL, { method:"POST", headers, body: JSON.stringify(payload) });
+    const body = await safeJson(r);
     if (!r.ok) {
-      log("err", `360 DEBUG: HTTP ${r.status}`, { url: V2_SEND_URL, payload, response: data });
-      return res.status(r.status).json({ ok: false, status: r.status, response: data });
+      log("err", `360 DEBUG: HTTP ${r.status}`, { url: V2_SEND_URL, response_body: body });
+      return res.status(r.status).json({ ok:false, status:r.status, response: body });
     }
-
-    log("ok", "Mensagem enviada com sucesso!", data);
-    res.json({ ok: true, response: data });
+    log("ok", "Mensagem enviada (debug/send)", body);
+    res.json({ ok:true, response: body });
   } catch (e) {
-    log("err", "Erro ao enviar mensagem", e);
-    res.status(500).json({ ok: false, error: String(e) });
+    log("err", "Exceção no debug/send", String(e));
+    res.status(500).json({ ok:false, error:String(e) });
   }
 });
 
-// ===== WEBHOOK =====
+// webhook do 360 (Cloud API)
 app.post("/webhook", async (req, res) => {
   try {
-    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    const from = msg?.from;
-    const text = msg?.text?.body;
+    const value = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const msg   = value?.messages?.[0];
+    const from  = msg?.from;
+    const text  = msg?.text?.body;
 
-    if (!text || !from) {
-      log("err", "Webhook recebido sem texto ou número");
+    if (!from || !text) {
+      log("warn", "Webhook sem from/text — ignorando");
       return res.sendStatus(200);
     }
 
-    log("ok", `Mensagem recebida de ${from}: ${text}`);
+    log("dbg", "msg IN", { from, text });
 
-    const payload = {
-      messaging_product: "whatsapp",
-      to: from,
-      type: "text",
-      text: { body: `Oi! Recebi: ${text}` }
-    };
+    // resposta simples
+    const payload = { messaging_product:"whatsapp", to: from, type:"text", text:{ body:`Eco: ${text}` } };
+    const headers = { "Content-Type":"application/json", "D360-API-KEY": D360_API_KEY };
 
-    const r = await fetch(V2_SEND_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "D360-API-KEY": D360_API_KEY
-      },
-      body: JSON.stringify(payload)
-    });
-
-    const data = await safeJson(r);
-    if (!r.ok) {
-      log("err", `Erro ao responder (${r.status})`, data);
-    } else {
-      log("ok", `Mensagem respondida com sucesso!`, data);
+    if (!D360_API_KEY || !PHONE_NUMBER_ID) {
+      log("err", "Faltam envs para responder", { hasKey: !!D360_API_KEY, PHONE_NUMBER_ID });
+      return res.sendStatus(200);
     }
 
+    log("dbg", "360 REQUEST (reply)", { url: V2_SEND_URL, headers: { ...headers, "D360-API-KEY":"<hidden>" }, payload });
+    const r = await fetch(V2_SEND_URL, { method:"POST", headers, body: JSON.stringify(payload) });
+    const body = await safeJson(r);
+
+    if (!r.ok) {
+      log("err", `Erro ao responder (${r.status})`, body);
+    } else {
+      log("ok", "Resposta enviada", body);
+    }
     res.sendStatus(200);
   } catch (e) {
-    log("err", "Exceção no webhook", e);
+    log("err", "Exceção no /webhook", String(e));
     res.sendStatus(200);
   }
 });
 
-// ===== INICIA SERVIDOR =====
-app.listen(PORT, () => {
-  console.log(`🚀 Kali-bot rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`🚀 listening :${PORT}`));
