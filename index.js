@@ -1,125 +1,124 @@
 import express from "express";
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
-// CONFIGURAÇÕES - VERIFIQUE TODAS
-const D360_API_KEY = process.env.D360_API_KEY;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+// CONFIGURAÇÕES
+const D360_API_KEY = process.env.D360_API_KEY?.trim();
 const PORT = process.env.PORT || 8080;
 
-// Validação inicial
+// Validação de configuração
 if (!D360_API_KEY) {
   console.error("❗ ERRO: D360_API_KEY não configurada");
-}
-if (!PHONE_NUMBER_ID) {
-  console.error("❗ ERRO: PHONE_NUMBER_ID não configurada");
 }
 
 const log = (lvl, msg, extra) => {
   const tag = lvl === "err" ? "🟥" : lvl === "ok" ? "✅" : "🟦";
-  console.log(`${tag} ${msg}`, extra ? JSON.stringify(extra, null, 2) : "");
+  console.log(`${tag} ${msg}`, extra ? JSON.stringify(extra) : "");
 };
 
-// Rota de saúde
+// Rota de teste / health
 app.get("/", (_, res) => {
-  res.json({ 
+  res.json({
     status: "ativo",
-    configuracao_ok: !!(D360_API_KEY && PHONE_NUMBER_ID)
+    config_ok: !!D360_API_KEY,
+    version: "1.2",
   });
 });
 
-// Webhook principal
+// Webhook principal (360dialog)
 app.post("/webhook", async (req, res) => {
   try {
-    log("🟦", "Webhook recebido", { headers: req.headers });
+    log("ok", "Webhook recebido", { count: req.body?.entry?.length });
 
-    // EXTRAÇÃO SEGURA DA MENSAGEM
+    // Extração segura
     const entry = req.body?.entry?.[0];
     const changes = entry?.changes?.[0];
     const value = changes?.value;
-    const messages = value?.messages?.[0];
-    
-    // Verificação completa
-    if (!value || !messages || !messages.text) {
-      log("ok", "Webhook sem mensagem de texto", { value, messages });
+    const message = value?.messages?.[0];
+
+    if (!entry || !changes || !value || !message) {
+      log("err", "Payload sem message", { body_keys: Object.keys(req.body || {}) });
       return res.sendStatus(200);
     }
 
-    const from = messages.from;
-    const text = messages.text.body;
-    
+    // Status webhooks (ack, delivered, read) — ignore
+    if (value?.statuses?.length) {
+      log("ok", "Evento de status ignorado", { kind: "status" });
+      return res.sendStatus(200);
+    }
+
+    // Só processa mensagem de texto
+    if (message.type !== "text" || !message.text?.body) {
+      log("ok", "Mensagem não-texto ignorada", { type: message.type });
+      return res.sendStatus(200);
+    }
+
+    const from = String(message.from || "").trim(); // wa_id do remetente
+    const text = String(message.text.body || "").trim();
+
     if (!from || !text) {
-      log("ok", "Faltando número ou texto", { from, text });
+      log("err", "Faltando from/text", { from, text });
       return res.sendStatus(200);
     }
 
-    log("✅", `Mensagem de ${from}: ${text}`);
+    // (Opcional) Validação simples do formato do WA ID
+    if (!/^\d{8,16}$/.test(from)) {
+      log("err", "WA ID inválido", { from });
+      return res.sendStatus(200);
+    }
 
-    // PAYLOAD CORRETO - NÃO MODIFIQUE
+    log("ok", `Recebido de ${from}: ${text}`);
+
+    // === ENVIO VIA 360dialog (schema correto) ===
+    const url = "https://waba-v2.360dialog.io/v1/messages";
     const payload = {
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to: from.toString(),  // Garante string
+      to: from,
       type: "text",
-      text: { 
-        body: "🎉 FUNCIONANDO! Assistente de dieta está ativo. Como posso ajudar com sua alimentação?" 
+      text: {
+        body: "🟢 FUNCIONANDO! Assistente de dieta está ativo. Como posso ajudar?"
       }
     };
 
-    // HEADERS CORRETOS
-    const headers = {
-      "Content-Type": "application/json",
-      "D360-API-KEY": D360_API_KEY
-    };
+    const headers = new Headers();
+    headers.append("Content-Type", "application/json");
+    headers.append("D360-API-KEY", D360_API_KEY);
 
-    // URL CORRETA
-    const url = `https://waba-v2.360dialog.io/v1/${PHONE_NUMBER_ID}/messages`;
-
-    log("➤", "Enviando resposta", { 
-      url: url.replace(PHONE_NUMBER_ID, "REDACTED"),
-      payload: { ...payload, to: "REDACTED" } 
+    log("ok", "Enviando resposta", {
+      url,
+      to: from,
+      payload_len: JSON.stringify(payload).length
     });
 
-    // TENTATIVA DE ENVIO
-    const r = await fetch(url, {
+    const response = await fetch(url, {
       method: "POST",
-      headers: headers,
+      headers,
       body: JSON.stringify(payload)
     });
 
-    const responseData = await r.text();
-    
-    if (!r.ok) {
-      log("❌", `Erro ${r.status} ${r.statusText}`, { 
-        status: r.status,
-        responseData: responseData.substring(0, 200) 
+    const raw = await response.text();
+    if (!response.ok) {
+      log("err", `Erro ${response.status} ${response.statusText}`, {
+        status: response.status,
+        body: raw.slice(0, 500)
       });
     } else {
-      log("✅", "MENSAGEM ENVIADA COM SUCESSO!", { 
-        status: r.status 
-      });
+      log("ok", "Resposta enviada com sucesso", { status: response.status });
     }
 
-    // Sempre responde 200 para o webhook
-    res.sendStatus(200);
-
+    return res.sendStatus(200);
   } catch (error) {
-    log("💥", "Erro crítico", {
+    log("err", "Erro no webhook", {
       message: error.message,
-      stack: error.stack?.split('\n').slice(0, 3)
+      name: error.name,
+      stack: error.stack?.split("\n")[1]?.trim()
     });
-    res.sendStatus(200);
+    return res.sendStatus(200);
   }
 });
 
 // Inicia o servidor
-const server = app.listen(PORT, () => {
+app.listen(PORT, () => {
   console.log(`🚀 SERVIDOR INICIADO NA PORTA ${PORT}`);
-  console.log(`🔔 Logs serão exibidos abaixo...`);
-});
-
-// Proteção contra erros não tratados
-process.on('uncaughtException', (error) => {
-  console.log(`⛔ ERRO NÃO TRATADO:`, error);
+  console.log(`🔔 Pronto para receber mensagens...`);
 });
