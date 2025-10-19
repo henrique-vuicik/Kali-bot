@@ -1,179 +1,129 @@
-// index.js
-// Servidor mínimo para Webhook 360dialog (Cloud API hosted by Meta) + fallback clássico
-// Node 18+ (fetch nativo). Procfile: `web: node index.js`
-
 import express from "express";
 
-// ---------- ENV ----------
+// ======= ENV & Config =======
 const PORT = process.env.PORT || 8080;
 
-// Se você preferir outros nomes, ajuste aqui:
-const API_KEY        = process.env.D360_API_KEY;                // Obrigatório
-const BASE_URL       = (process.env.D360_BASE_URL || "https://waba-v2.360dialog.io").trim(); // Obrigatório
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || process.env.WABA_CHANNEL_EXTERNAL_ID; // Para modo Cloud API
-const FROM_NUMBER     = process.env.FROM_NUMBER;                // Para modo clássico
+// Use APENAS 360 v2
+const BASE_URL = (process.env.BASE_URL || "https://waba-v2.360dialog.io/").trim().replace(/\/+$/, "/");
+const D360_API_KEY = process.env.D360_API_KEY?.trim();
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID?.trim(); // não usado pelo v2, mas deixamos logado
+const FROM_NUMBER = process.env.FROM_NUMBER?.trim();         // opcional no v2; usamos para consistência
 
-// ---------- APP ----------
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ---------- LOG UTILS ----------
-const log = (...args) => console.log(...args);
-const err = (...args) => console.error(...args);
-
-// ---------- HEALTH / DEBUG ----------
+// Raiz mostra um "health + envs úteis" (sem vazar segredo)
 app.get("/", (_req, res) => {
-  res.type("application/json").send(
-    JSON.stringify(
-      {
-        has_API_KEY: !!API_KEY,
-        BASE_URL,
-        PHONE_NUMBER_ID: PHONE_NUMBER_ID || null,
-        FROM_NUMBER: FROM_NUMBER || null,
-        PORT: String(PORT),
-      },
-      null,
-      2
-    )
-  );
+  res.json({
+    ok: true,
+    using_360_v2: true,
+    BASE_URL,
+    has_API_KEY: Boolean(D360_API_KEY),
+    PHONE_NUMBER_ID,
+    FROM_NUMBER,
+    PORT
+  });
 });
 
-app.get("/health", (_req, res) => res.send("ok"));
+// ======= Helpers =======
+function build360Url(path) {
+  // garante BASE_URL com / no fim; concatena sem duplicar barras
+  return BASE_URL + path.replace(/^\/+/, "");
+}
 
-// ---------- ENVIAR MENSAGEM (Cloud API -> fallback clássico) ----------
-async function sendTextVia360(to, text) {
-  if (!API_KEY || !BASE_URL) {
-    throw new Error("Faltam envs: D360_API_KEY ou D360_BASE_URL");
-  }
-  const base = BASE_URL.replace(/\/+$/, "");
-  const headersJson = { "Content-Type": "application/json", Accept: "application/json" };
-
-  // 1) Tenta modo Cloud API (proxy v2)
-  try {
-    if (!PHONE_NUMBER_ID) throw new Error("Sem PHONE_NUMBER_ID para modo Cloud API");
-
-    const urlCloud = `${base}/v1/${PHONE_NUMBER_ID}/messages`;
-    const payloadCloud = {
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text },
-      preview_url: false,
-    };
-
-    const r1 = await fetch(urlCloud, {
-      method: "POST",
-      headers: { ...headersJson, Authorization: `Bearer ${API_KEY}` },
-      body: JSON.stringify(payloadCloud),
-    });
-
-    const body1 = await r1.text();
-    if (r1.ok) {
-      log(`✅ 360 Cloud API OK: ${body1}`);
-      try { return JSON.parse(body1); } catch { return { ok: true, raw: body1 }; }
-    } else {
-      err(`🛑 360 (Cloud API) HTTP ${r1.status} - ${body1}`);
-      if (r1.status >= 400 && r1.status < 500) throw new Error("fallback");
-      throw new Error(`Cloud API falhou: ${r1.status} - ${body1}`);
-    }
-  } catch (e) {
-    if (String(e.message) !== "fallback") {
-      log(`ℹ️ pulando para modo clássico: ${e.message}`);
-    }
+async function send360Text(to, body) {
+  if (!D360_API_KEY || !BASE_URL) {
+    throw new Error("Faltam envs: D360_API_KEY ou BASE_URL");
   }
 
-  // 2) Fallback: modo 360 clássico (header D360-API-KEY + body com 'from')
-  if (!FROM_NUMBER) throw new Error("Sem FROM_NUMBER para modo clássico");
+  const url = build360Url("/v1/messages");
+  const payload = {
+    to,
+    type: "text",
+    text: { body }
+  };
 
-  const urlClassic = `${base}/v1/messages`;
-  const payloadClassic = { from: FROM_NUMBER, to, type: "text", text: { body: text } };
+  // No 360 v2 o "from" costuma ser opcional (amarrado ao canal).
+  // Se quiser forçar, descomente a linha abaixo:
+  if (FROM_NUMBER) payload.from = FROM_NUMBER;
 
-  const r2 = await fetch(urlClassic, {
+  const r = await fetch(url, {
     method: "POST",
-    headers: { ...headersJson, "D360-API-KEY": API_KEY },
-    body: JSON.stringify(payloadClassic),
+    headers: {
+      "Content-Type": "application/json",
+      "D360-API-KEY": D360_API_KEY
+    },
+    body: JSON.stringify(payload),
+    // timeout de bom senso (Railway derruba muito cedo às vezes)
   });
 
-  const body2 = await r2.text();
-  if (r2.ok) {
-    log(`✅ 360 clássico OK: ${body2}`);
-    try { return JSON.parse(body2); } catch { return { ok: true, raw: body2 }; }
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+
+  if (!r.ok) {
+    // 360 às vezes devolve {meta:{http_code,...}}. Vamos extrair tudo que ajuda.
+    const meta = (data && data.meta) ? data.meta : undefined;
+    const msg = meta?.developer_message || data?.error || r.statusText || "Erro 360";
+    const trace = meta?.["360dialog_trace_id"];
+    const more = trace ? ` | trace_id=${trace}` : "";
+    throw new Error(`360 HTTP ${meta?.http_code || r.status} - ${msg}${more}`);
   }
-  throw new Error(`360 clássico HTTP ${r2.status} - ${body2}`);
+
+  return data;
 }
 
-// ---------- PARSE DO WEBHOOK ----------
-/*
-Suportamos:
-1) Estilo Cloud API (body.object == "whatsapp_business_account")
-   body.entry[].changes[].value.messages[]  com .from e .text.body
-2) Estilo 360 clássico de exemplos (body.messages[] direto)
-*/
-function extractIncomingMessages(body) {
-  const out = [];
-
-  // Estilo Cloud API
-  if (body && body.object === "whatsapp_business_account" && Array.isArray(body.entry)) {
-    for (const ent of body.entry) {
-      if (!ent.changes) continue;
-      for (const ch of ent.changes) {
-        const v = ch.value || {};
-        const messages = v.messages || [];
-        for (const m of messages) {
-          const from = m.from;
-          const txt = m.text?.body;
-          if (from && typeof txt === "string" && txt.length) {
-            out.push({ from, text: txt });
-          }
-        }
-      }
-    }
-  }
-
-  // Estilo 360 “simples”
-  if (Array.isArray(body?.messages)) {
-    for (const m of body.messages) {
-      const from = m.from;
-      const txt = m.text?.body;
-      if (from && typeof txt === "string" && txt.length) {
-        out.push({ from, text: txt });
-      }
-    }
-  }
-
-  return out;
-}
-
-// ---------- WEBHOOK ----------
+// ======= Webhook =======
 app.post("/webhook", async (req, res) => {
   try {
-    const msgs = extractIncomingMessages(req.body);
-
-    if (!msgs.length) {
-      log("ℹ️ webhook recebido, mas sem texto ou sem 'from'.");
-      return res.sendStatus(200);
-    }
-
-    // Processa cada mensagem textual recebida
-    for (const { from, text } of msgs) {
-      log(`💬 msg de ${from}: "${text}"`);
-
-      try {
-        const reply = `Recebido: ${text}`;
-        await sendTextVia360(from, reply);
-      } catch (e) {
-        err(`🛑 erro ao responder ${from}: ${e?.message || e}`);
-      }
-    }
-
+    // Responde rápido para não estourar timeout do 360
     res.sendStatus(200);
+
+    const raw = req.body;
+    // 360 “Hosted by Meta” envia no formato Cloud API (object/entry/changes)
+    // Vamos tentar extrair texto de ambos formatos.
+    let from, text;
+
+    // Formato Cloud API-style
+    if (raw?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
+      const m = raw.entry[0].changes[0].value.messages[0];
+      from = m.from;
+      text = m.text?.body;
+    }
+
+    // Formato 360 clássico
+    if (!from && raw?.messages?.[0]) {
+      const m = raw.messages[0];
+      from = m.from;
+      text = m.text?.body;
+    }
+
+    if (!from || !text) {
+      console.log("ℹ️ payload sem texto ou sem from. Nada a fazer.");
+      return;
+    }
+
+    console.log(`💬 msg de ${from}: "${text}"`);
+
+    // Resposta “ping” simples
+    const reply = `Recebi: "${text}" ✔︎`;
+
+    try {
+      const resp = await send360Text(from, reply);
+      const meta = resp?.meta;
+      const trace = meta?.["360dialog_trace_id"];
+      console.log(`✅ enviado para ${from} ${trace ? `(trace ${trace})` : ""}`);
+    } catch (e) {
+      console.error(`🛑 erro ao responder ${from}: ${e.message}`);
+    }
   } catch (e) {
-    err("❌ erro no webhook:", e);
-    res.sendStatus(500);
+    // Se der erro ANTES do res.status(200), garantimos 200
+    try { res.sendStatus(200); } catch {}
+    console.error("❌ Erro no webhook:", e.message);
   }
 });
 
-// ---------- START ----------
+// ======= Start =======
 app.listen(PORT, () => {
-  log(`🚀 listening :${PORT}`);
+  console.log(`🚀 listening :${PORT}`);
 });
