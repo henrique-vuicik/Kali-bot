@@ -18,18 +18,26 @@ app.get("/", (_, res) => {
 
 app.post("/webhook", async (req, res) => {
   try {
-    const from = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.from;
-    const text = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]?.text?.body;
+    // Extração correta da mensagem
+    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const from = message?.from;
+    const text = message?.text?.body;
     
-    if (!from || !text) return res.sendStatus(200);
+    if (!from || !text || !message) {
+      return res.sendStatus(200);
+    }
 
     log("ok", `Recebido de ${from}: ${text}`);
 
+    // Payload corrigido com recipient_type
     const payload = {
       messaging_product: "whatsapp",
+      recipient_type: "individual",  // ✅ Campo obrigatório adicionado
       to: from,
       type: "text",
-      text: { body: "Olá! Estou funcionando!" }
+      text: { 
+        body: "✅ Funcionando! Este é seu assistente de dieta." 
+      }
     };
 
     const headers = {
@@ -38,6 +46,8 @@ app.post("/webhook", async (req, res) => {
     };
 
     const url = `https://waba-v2.360dialog.io/v1/${PHONE_NUMBER_ID}/messages`;
+
+    log("🟦", "Enviando", { url, payload });
 
     const r = await fetch(url, {
       method: "POST",
@@ -50,13 +60,13 @@ app.post("/webhook", async (req, res) => {
     if (!r.ok) {
       log("err", `Erro ${r.status}`, { data });
     } else {
-      log("ok", "Resposta enviada!");
+      log("ok", "Resposta enviada com sucesso!");
     }
 
     res.sendStatus(200);
 
   } catch (e) {
-    log("err", "Erro", { message: e.message });
+    log("err", "Erro no webhook", { message: e.message });
     res.sendStatus(200);
   }
 });
