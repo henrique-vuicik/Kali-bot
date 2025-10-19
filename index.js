@@ -1,18 +1,16 @@
 import express from "express";
 
-// ======= ENV & Config =======
+// ====== ENV ======
 const PORT = process.env.PORT || 8080;
-
-// Use APENAS 360 v2
 const BASE_URL = (process.env.BASE_URL || "https://waba-v2.360dialog.io/").trim().replace(/\/+$/, "/");
-const D360_API_KEY = process.env.D360_API_KEY?.trim();
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID?.trim(); // não usado pelo v2, mas deixamos logado
-const FROM_NUMBER = process.env.FROM_NUMBER?.trim();         // opcional no v2; usamos para consistência
+const D360_API_KEY = process.env.D360_API_KEY?.trim() || "";
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID?.trim() || "";
+const FROM_NUMBER = (process.env.FROM_NUMBER || "").trim(); // vamos deixar OPCIONAL
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// Raiz mostra um "health + envs úteis" (sem vazar segredo)
+// Health/debug
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
@@ -20,71 +18,78 @@ app.get("/", (_req, res) => {
     BASE_URL,
     has_API_KEY: Boolean(D360_API_KEY),
     PHONE_NUMBER_ID,
-    FROM_NUMBER,
+    has_FROM_NUMBER: Boolean(FROM_NUMBER),
     PORT
   });
 });
 
-// ======= Helpers =======
-function build360Url(path) {
-  // garante BASE_URL com / no fim; concatena sem duplicar barras
-  return BASE_URL + path.replace(/^\/+/, "");
+// ====== helpers ======
+function url360(path) {
+  return BASE_URL + path.replace(/^\//, "");
 }
 
-async function send360Text(to, body) {
+async function send360Text(to, textBody) {
   if (!D360_API_KEY || !BASE_URL) {
     throw new Error("Faltam envs: D360_API_KEY ou BASE_URL");
   }
 
-  const url = build360Url("/v1/messages");
+  // Payload “Cloud API-like” aceito pelo 360 v2
   const payload = {
-    to,
+    messaging_product: "whatsapp",
+    to: String(to),
     type: "text",
-    text: { body }
+    text: { body: String(textBody) }
   };
 
-  // No 360 v2 o "from" costuma ser opcional (amarrado ao canal).
-  // Se quiser forçar, descomente a linha abaixo:
-  if (FROM_NUMBER) payload.from = FROM_NUMBER;
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "D360-API-KEY": D360_API_KEY
-    },
-    body: JSON.stringify(payload),
-    // timeout de bom senso (Railway derruba muito cedo às vezes)
-  });
-
-  const text = await r.text();
-  let data;
-  try { data = JSON.parse(text); } catch { data = text; }
-
-  if (!r.ok) {
-    // 360 às vezes devolve {meta:{http_code,...}}. Vamos extrair tudo que ajuda.
-    const meta = (data && data.meta) ? data.meta : undefined;
-    const msg = meta?.developer_message || data?.error || r.statusText || "Erro 360";
-    const trace = meta?.["360dialog_trace_id"];
-    const more = trace ? ` | trace_id=${trace}` : "";
-    throw new Error(`360 HTTP ${meta?.http_code || r.status} - ${msg}${more}`);
+  // ⚠️ Muitos canais rejeitam quando incluímos "from". Teste PRIMEIRO SEM.
+  if (FROM_NUMBER) {
+    // Se precisar muito, descomente a linha abaixo:
+    // payload.from = FROM_NUMBER;
   }
 
-  return data;
+  const url = url360("/v1/messages");
+  const hdrs = {
+    "Content-Type": "application/json",
+    "D360-API-KEY": D360_API_KEY
+  };
+
+  const res = await fetch(url, { method: "POST", headers: hdrs, body: JSON.stringify(payload) });
+  const rawText = await res.text();
+
+  // Tente parsear o corpo
+  let body;
+  try { body = JSON.parse(rawText); } catch { body = rawText; }
+
+  if (!res.ok) {
+    // Extraia o máximo possível para log
+    const meta = body?.meta;
+    const code = meta?.http_code || res.status;
+    const dev = meta?.developer_message || body?.error || res.statusText || "Bad request";
+    const trace = meta?.["360dialog_trace_id"];
+    const details = {
+      url,
+      request_headers: { "Content-Type": hdrs["Content-Type"], "D360-API-KEY": "<hidden>" },
+      request_body: payload,
+      response_status: res.status,
+      response_body: body
+    };
+    console.error("🟥 360 DEBUG:", JSON.stringify(details, null, 2));
+    throw new Error(`360 HTTP ${code} - ${dev}${trace ? ` | trace=${trace}` : ""}`);
+  }
+
+  return body;
 }
 
-// ======= Webhook =======
+// ====== webhook ======
 app.post("/webhook", async (req, res) => {
-  try {
-    // Responde rápido para não estourar timeout do 360
-    res.sendStatus(200);
+  // sempre 200 rápido
+  res.sendStatus(200);
 
+  try {
     const raw = req.body;
-    // 360 “Hosted by Meta” envia no formato Cloud API (object/entry/changes)
-    // Vamos tentar extrair texto de ambos formatos.
     let from, text;
 
-    // Formato Cloud API-style
+    // Formato Cloud-API (Hosted by Meta)
     if (raw?.entry?.[0]?.changes?.[0]?.value?.messages?.[0]) {
       const m = raw.entry[0].changes[0].value.messages[0];
       from = m.from;
@@ -105,25 +110,29 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`💬 msg de ${from}: "${text}"`);
 
-    // Resposta “ping” simples
-    const reply = `Recebi: "${text}" ✔︎`;
-
     try {
+      const reply = `Recebi: "${text}" ✔︎`;
       const resp = await send360Text(from, reply);
       const meta = resp?.meta;
-      const trace = meta?.["360dialog_trace_id"];
-      console.log(`✅ enviado para ${from} ${trace ? `(trace ${trace})` : ""}`);
+      console.log(`✅ enviado para ${from}${meta?.["360dialog_trace_id"] ? ` (trace ${meta["360dialog_trace_id"]})` : ""}`);
     } catch (e) {
       console.error(`🛑 erro ao responder ${from}: ${e.message}`);
     }
   } catch (e) {
-    // Se der erro ANTES do res.status(200), garantimos 200
-    try { res.sendStatus(200); } catch {}
-    console.error("❌ Erro no webhook:", e.message);
+    console.error("❌ Erro no webhook:", e);
   }
 });
 
-// ======= Start =======
-app.listen(PORT, () => {
-  console.log(`🚀 listening :${PORT}`);
+// ====== util de teste via navegador ======
+// /debug/send?to=554299401345&text=Ola
+app.get("/debug/send", async (req, res) => {
+  const { to, text } = req.query;
+  try {
+    const out = await send360Text(to, text || "ping");
+    res.json({ ok: true, out });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
+
+app.listen(PORT, () => console.log(`🚀 listening :${PORT}`));
