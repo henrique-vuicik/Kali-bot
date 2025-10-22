@@ -3,21 +3,22 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
-// 🔧 Configurações
+// 🔧 Variáveis de ambiente (Railway → Variables)
 const D360_API_KEY = process.env.D360_API_KEY?.trim();
 const PORT = process.env.PORT || 8080;
 
+// 🔎 logger simples
 const log = (lvl, msg, extra) => {
-  const tag =
-    lvl === "err" ? "🟥" : lvl === "ok" ? "✅" : lvl === "💥" ? "💥" : "🟦";
+  const tag = lvl === "err" ? "🟥" : lvl === "ok" ? "✅" : "🟦";
   console.log(`${tag} ${msg}`, extra ? JSON.stringify(extra) : "");
 };
 
+// 🔔 Webhook de mensagens
 app.post("/webhook", async (req, res) => {
   try {
     log("🟦", "Webhook recebido");
 
-    // 📥 Extração da mensagem recebida
+    // 📥 Extrai a primeira mensagem do evento
     const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     const from = message?.from?.toString();
     const text = message?.text?.body;
@@ -27,63 +28,61 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    // 📞 Log do número real
-    log("ok", `Mensagem recebida do número: ${from}`, { texto: text });
+    log("✅", "Mensagem recebida", { from, text });
 
-    // 🔍 Validação básica do número (Brasil)
-    if (!from.startsWith("55") || from.length < 10) {
-      log("err", "Número inválido", { from });
+    // Validação leve do número (formato wa: só dígitos com DDI)
+    if (!/^\d{10,16}$/.test(from)) {
+      log("err", "Número inválido para envio", { from });
       return res.sendStatus(200);
     }
 
-    // 🌐 URL correta da 360dialog (sem PHONE_NUMBER_ID)
+    // 🌐 Endpoint correto da 360dialog (Cloud API)
+    // Se o teu “Hosting Platform Type” no 360D diz “Cloud API hosted by Meta”, usa este domínio:
     const url = "https://waba-v2.360dialog.io/v1/messages";
 
-    // 💬 Payload compatível com a 360dialog Cloud API
+    // 💬 Payload EXATO exigido pela Cloud API (inclui messaging_product)
     const payload = {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
       to: from,
       type: "text",
       text: {
-        body:
-          "🟢 FUNCIONANDO! Assistente de dieta ativo. Como posso ajudar?"
-      },
+        preview_url: false,
+        body: "🟢 FUNCIONANDO! Assistente de dieta ativo. Como posso ajudar?"
+      }
     };
 
-    // 🧾 Cabeçalhos da requisição
+    // 🧾 Headers exigidos pela 360dialog
     const headers = {
       "Content-Type": "application/json",
-      "D360-API-KEY": D360_API_KEY,
+      "Accept": "application/json",
+      "D360-API-KEY": D360_API_KEY
     };
 
-    // 🚀 Envio da resposta via API 360dialog
-    const response = await fetch(url, {
+    // 🚀 Envia a resposta
+    const resp = await fetch(url, {
       method: "POST",
-      headers: headers,
-      body: JSON.stringify(payload),
+      headers,
+      body: JSON.stringify(payload)
     });
 
-    const body = await response.text();
-
-    if (!response.ok) {
-      log("err", `Erro ${response.status}`, {
-        status: response.status,
-        body: body.substring(0, 200),
-      });
+    const respText = await resp.text();
+    if (!resp.ok) {
+      log("err", `Erro ${resp.status}`, { body: respText?.slice(0, 500) });
     } else {
-      log("ok", "✔️ RESPOSTA ENVIADA COM SUCESSO!", { numero: from });
+      log("✅", "Resposta enviada com sucesso", { numero: from, resp: respText });
     }
 
     res.sendStatus(200);
-  } catch (error) {
-    log("💥", "Erro no webhook", {
-      message: error.message,
-      stack: error.stack?.split("\n")[1]?.trim(),
-    });
+  } catch (e) {
+    log("err", "Falha no webhook", { message: e.message });
     res.sendStatus(200);
   }
 });
 
+// ♻️ Endpoint simples pra teste (“healthcheck”)
+app.get("/", (_req, res) => res.send("OK"));
+
 app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`🔔 Aguardando mensagens de QUALQUER número válido...`);
+  console.log(`🚀 Servidor na porta ${PORT}`);
 });
