@@ -68,4 +68,45 @@ async function sendMessage(to, textBody) {
   }
 }
 
-// ===== Webhook (mensagem recebida
+// ===== Webhook (mensagem recebida do WhatsApp) =====
+app.post("/webhook", async (req, res) => {
+  log("IN", "Webhook recebido");
+
+  try {
+    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const from = message?.from?.toString?.() || "";
+    const text = message?.text?.body || "";
+
+    if (!from || !text) {
+      log("ERR", "Webhook sem 'from' ou 'text'", req.body);
+      return res.sendStatus(200);
+    }
+
+    log("OK", `Mensagem recebida de ${from}: ${text}`);
+
+    // ===== Resposta automática =====
+    let reply = "🟢 Funcionando! Kali ativa e conectada 💬";
+    const t = text.trim().toLowerCase();
+
+    if (["oi", "olá", "ola", "hi", "hello"].includes(t)) {
+      reply = "👋 Oi! Eu sou a Kali, sua assistente de nutrição. Como posso te ajudar hoje?";
+    } else if (t.includes("cardápio") || t.includes("cardapio")) {
+      reply = "📋 Me conte seus horários e restrições, e eu monto um cardápio básico pra você.";
+    } else if (t.includes("tirzepatida")) {
+      reply = "💉 A tirzepatida é um excelente apoio no emagrecimento, mas precisa de acompanhamento médico. Deseja agendar uma consulta?";
+    }
+
+    await sendMessage(from, reply);
+    res.sendStatus(200);
+  } catch (error) {
+    log("ERR", "Falha ao processar webhook", error.message);
+    res.sendStatus(200);
+  }
+});
+
+// ===== Inicialização =====
+app.listen(PORT, () => {
+  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  console.log(`🔔 Provider: 360dialog`);
+  if (!CLOUD_API_TOKEN) console.log("⚠️ ATENÇÃO: CLOUD_API_TOKEN (D360-API-KEY) não configurado!");
+});
