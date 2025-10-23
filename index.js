@@ -1,111 +1,173 @@
-// index.js
-// Kali Cloud - integração WhatsApp via 360dialog
+// index.js (CommonJS)
+// Requisitos: express, axios, body-parser
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
 
-import express from "express";
-
-const app = express();
-app.use(express.json({ verify: (req, _res, buf) => (req.rawBody = buf?.toString?.() || "") }));
-
-// =========================
-// CONFIGURAÇÕES
-// =========================
+// ---------- Config ----------
 const PORT = process.env.PORT || 8080;
-const D360_API_KEY = (process.env.D360_API_KEY || process.env.CLOUD_API_TOKEN || "").trim();
-const API_URL = "https://waba-v2.360dialog.io/v1/messages";
+const D360_API_KEY = process.env.D360_API_KEY || '';
+const D360_BASE_URL = (process.env.D360_BASE_URL || 'https://waba-v2.360dialog.io').replace(/\/+$/, '');
+const WHATSAPP_FROM = process.env.WHATSAPP_FROM || ''; // opcional: só use se a 360 exigir
+const TEST_TO = process.env.TEST_TO || '';             // número pra teste automático
 
-// =========================
-// LOG BONITO
-// =========================
-const log = (tag, msg, extra) => {
-  const icon = tag === "ERR" ? "🟥" : tag === "OK" ? "🟩" : tag === "IN" ? "🟦" : "ℹ️";
-  console.log(`${icon} ${msg}`, extra ? (typeof extra === "string" ? extra : JSON.stringify(extra)) : "");
-};
+// ---------- Util ----------
+function logOk(msg, extra)   { console.log('🟩', msg, extra ? JSON.stringify(extra) : ''); }
+function logInfo(msg, extra) { console.log('🟦', msg, extra ? JSON.stringify(extra) : ''); }
+function logWarn(msg, extra) { console.log('🟨', msg, extra ? JSON.stringify(extra) : ''); }
+function logErr(msg, extra)  { console.log('🟥', msg, extra ? JSON.stringify(extra) : ''); }
 
-// =========================
-// HEALTHCHECK
-// =========================
-app.get("/", (_req, res) => {
-  res.status(200).send({
-    status: "ok",
-    provider: "360dialog",
-    api_url: API_URL,
+function httpClient() {
+  return axios.create({
+    baseURL: D360_BASE_URL,
+    headers: {
+      'D360-API-KEY': D360_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    timeout: 15000,
+    validateStatus: () => true
+  });
+}
+
+// ---------- Envio 360dialog ----------
+/**
+ * Tenta enviar texto com 3 variações, nessa ordem:
+ * 1) POST /v1/messages  (payload "simples" da 360)
+ * 2) POST /v1/messages  (payload com "messaging_product"/"recipient_type")
+ * 3) POST /messages      (endpoint legado)
+ * 
+ * Se "WHATSAPP_FROM" estiver setado, ele acrescenta "from" (variações 1 e 2)
+ */
+async function sendText360({ to, body }) {
+  const api = httpClient();
+  const tries = [];
+
+  // #1 – Padrão 360 (sem messaging_product)
+  tries.push({
+    name: 'v1/messages (padrão 360)',
+    url: '/v1/messages',
+    payload: {
+      to: String(to),
+      type: 'text',
+      text: { body: String(body) },
+      ...(WHATSAPP_FROM ? { from: String(WHATSAPP_FROM) } : {})
+    }
+  });
+
+  // #2 – Mesmo endpoint, mas com "messaging_product"
+  tries.push({
+    name: 'v1/messages (+ messaging_product)',
+    url: '/v1/messages',
+    payload: {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: String(to),
+      type: 'text',
+      text: {
+        preview_url: false,
+        body: String(body)
+      },
+      ...(WHATSAPP_FROM ? { from: String(WHATSAPP_FROM) } : {})
+    }
+  });
+
+  // #3 – Endpoint legado da 360
+  tries.push({
+    name: 'messages (legacy)',
+    url: '/messages',
+    payload: {
+      to: String(to),
+      type: 'text',
+      text: { body: String(body) }
+    }
+  });
+
+  for (const t of tries) {
+    logInfo(`Enviando via: ${t.name} -> ${D360_BASE_URL}${t.url}`, t.payload);
+    const res = await api.post(t.url, t.payload).catch(e => ({ status: 0, data: { error: e.message } }));
+    const status = res.status || 0;
+
+    if (status >= 200 && status < 300) {
+      logOk(`OK ${status} em "${t.name}"`, res.data);
+      return { ok: true, tryUsed: t.name, status, data: res.data };
+    }
+
+    // Erro: registra e tenta a próxima variação
+    logErr(`Falha ${status} em "${t.name}"`, res.data);
+    // Se for erro claro de "messaging_product is required", já sabemos que a #2 deve ser usada
+    if (status === 400 && res?.data && JSON.stringify(res.data).toLowerCase().includes('messaging_product is required')) {
+      logWarn('API exigiu "messaging_product". Tentando variação com esse campo…');
+    }
+  }
+
+  return { ok: false, error: 'Todas as variações falharam. Veja os logs acima.' };
+}
+
+// ---------- Servidor ----------
+const app = express();
+app.use(bodyParser.json());
+
+// Health / Home
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'kali-bot',
+    base: D360_BASE_URL,
+    time: new Date().toISOString()
   });
 });
 
-// =========================
-// FUNÇÃO PARA ENVIAR MENSAGEM
-// =========================
-async function sendMessage(to, bodyText) {
-  const payload = {
-    preview_url: false,
-    recipient_type: "individual",
-    to,
-    type: "text",
-    text: { body: bodyText },
-  };
+// Webhook de entrada (360dialog -> seu bot)
+app.post('/webhook', async (req, res) => {
+  logInfo('Webhook recebido');
+  const body = req.body || {};
 
   try {
-    const response = await fetch(API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "D360-API-KEY": D360_API_KEY,
-      },
-      body: JSON.stringify(payload),
-    });
+    // Normalmente 360 manda algo como:
+    // { messages: [{ from: "55...", text: { body: "Oi" } , ... }] , ... }
+    const msg = body?.messages?.[0] || body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0] || null;
+    const from = msg?.from || body?.from;
+    const text = msg?.text?.body || body?.text || '';
 
-    const data = await response.text();
-    if (!response.ok) throw new Error(`${response.status} ${data}`);
-
-    log("OK", "Mensagem enviada com sucesso", data);
-    return data;
-  } catch (error) {
-    log("ERR", "Falha no envio", error.message);
-  }
-}
-
-// =========================
-// WEBHOOK DE RECEBIMENTO
-// =========================
-app.post("/webhook", async (req, res) => {
-  log("IN", "Webhook recebido");
-
-  try {
-    const message = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    const from = message?.from || "";
-    const text = message?.text?.body || "";
-
-    if (!from || !text) {
-      log("ERR", "Webhook sem 'from' ou 'text'", req.body);
-      return res.sendStatus(200);
+    if (!from) {
+      logWarn('Webhook sem "from" identificável', body);
+      res.status(200).json({ received: true });
+      return;
     }
 
-    log("OK", `Mensagem recebida de ${from}: ${text}`);
+    logOk(`Mensagem recebida de ${from}: ${text || '(vazio)'}`);
 
-    let reply = "👋 Oi! Eu sou a Kali, sua assistente de nutrição. Tudo bem?";
-    const lower = text.trim().toLowerCase();
+    // Responde ecoando o texto
+    const reply = text ? `Recebido: ${text}` : 'Recebido 👌';
+    const sent = await sendText360({ to: from, body: reply });
 
-    if (["oi", "olá", "ola"].includes(lower)) {
-      reply = "👋 Olá! Como posso te ajudar hoje?";
-    } else if (lower.includes("cardápio") || lower.includes("cardapio")) {
-      reply = "📋 Posso montar um cardápio básico pra você. Quais seus horários e restrições?";
-    } else if (lower.includes("tirzepatida")) {
-      reply = "💉 A tirzepatida pode ser um ótimo suporte, mas requer acompanhamento médico. Deseja saber mais?";
+    if (!sent.ok) {
+      logErr('Erro ao enviar resposta', sent);
     }
 
-    await sendMessage(from, reply);
-    res.sendStatus(200);
-  } catch (error) {
-    log("ERR", "Erro no webhook", error.message);
-    res.sendStatus(200);
+    res.status(200).json({ received: true });
+  } catch (e) {
+    logErr('Exceção no webhook', { message: e.message, stack: e.stack });
+    res.status(200).json({ received: true });
   }
 });
 
-// =========================
-// START SERVER
-// =========================
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`🔔 Endpoint 360dialog: ${API_URL}`);
-  if (!D360_API_KEY) console.log("⚠️ ATENÇÃO: D360_API_KEY não configurada!");
+// Inicia servidor
+app.listen(PORT, async () => {
+  logOk(`🚀 Servidor rodando na porta ${PORT}`);
+  logInfo(`🔔 Endpoint 360dialog: ${D360_BASE_URL}/v1/messages`);
+
+  // Teste automático na inicialização
+  if (!D360_API_KEY) {
+    logWarn('Falta D360_API_KEY nos variables do Railway!');
+  }
+  if (TEST_TO && D360_API_KEY) {
+    logInfo('🔎 Rodando teste de envio inicial…');
+    const sent = await sendText360({ to: TEST_TO, body: 'Teste automático ✅' });
+    if (!sent.ok) {
+      logErr('Teste automático FALHOU', sent);
+    }
+  } else {
+    logInfo('Teste automático não executado (defina TEST_TO e D360_API_KEY).');
+  }
 });
