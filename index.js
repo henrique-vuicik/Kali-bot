@@ -1,10 +1,9 @@
 // index.js
 // Kali Nutro IA – WhatsApp (360dialog) + OpenAI
-// Requisitos de ambiente: OPENAI_API_KEY, D360_API_KEY
-// Node 18+ (tem fetch nativo). Sem node-fetch.
+// Requisitos: OPENAI_API_KEY, D360_API_KEY
+// Node 18+ (fetch nativo). Não usa node-fetch.
 
 const express = require("express");
-const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -13,49 +12,47 @@ app.use(express.json({ limit: "1mb" }));
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const D360_API_KEY = process.env.D360_API_KEY;
+
 const D360_BASE = "https://waba-v2.360dialog.io";
-const D360_SEND = `${D360_BASE}/v1/messages`;
+const D360_V1 = `${D360_BASE}/v1/messages`;   // novo
+const D360_LEGACY = `${D360_BASE}/messages`;   // fallback (este já deu 200 nos seus logs)
 
 const NUTRO_SYSTEM = `
 Você é a *Kali*, assistente de nutrologia focada em dieta e calorias.
 Tarefas:
 1) Interpretar texto livre em PT-BR sobre o que a pessoa comeu/bebeu.
 2) Extrair itens com quantidade e unidade (quando possível).
-3) Estimar *calorias por item* e *total*, com base em tabelas nutricionais comuns (valores médios, ok supor ranges).
-4) Retornar *apenas JSON* no formato abaixo, sem texto fora do JSON:
+3) Estimar *calorias por item* e *total*, usando valores médios.
+4) Responder em *JSON puro* exatamente neste formato:
 
 {
   "items":[
-    {"nome":"pão francês", "quantidade":2, "unidade":"fatia", "kcal":160},
-    {"nome":"ovo", "quantidade":1, "unidade":"un", "kcal":70},
-    {"nome":"café preto", "quantidade":1, "unidade":"xícara", "kcal":2}
+    {"nome":"pão francês","quantidade":2,"unidade":"fatia","kcal":160},
+    {"nome":"ovo","quantidade":1,"unidade":"un","kcal":70},
+    {"nome":"café preto","quantidade":1,"unidade":"xícara","kcal":2}
   ],
   "total_kcal":232,
-  "dica_curta":"Combine proteína magra em próximas refeições para maior saciedade."
+  "dica_curta":"Combine proteína magra na próxima refeição."
 }
 
 Regras:
-- Se o usuário não informar quantidade, estimar o *típico* (ex.: 1 xícara, 1 unidade, 100 g).
-- Se algo for ambiguo, escolha o mais comum no Brasil.
-- Não invente pratos não citados.
-- Sempre some as calorias e preencha "total_kcal".
-- "dica_curta" até 140 caracteres, prática e em linguagem simples.
+- Se não informarem quantidade, estime o típico no Brasil.
+- Não invente itens não citados.
+- Sempre preencha "total_kcal".
+- "dica_curta" com até 140 caracteres, prática.
 `;
 
-// --------- Utilidades ---------
+// --------- Log helpers ---------
 const log = {
-  info: (msg) => console.log(msg),
-  blue: (msg) => console.log(`\x1b[34m${msg}\x1b[0m`),
-  green: (msg) => console.log(`\x1b[32m${msg}\x1b[0m`),
-  red: (msg) => console.error(`\x1b[31m${msg}\x1b[0m`),
-  yellow: (msg) => console.warn(`\x1b[33m${msg}\x1b[0m`),
+  blue: (m) => console.log(`\x1b[34m${m}\x1b[0m`),
+  green: (m) => console.log(`\x1b[32m${m}\x1b[0m`),
+  yellow: (m) => console.warn(`\x1b[33m${m}\x1b[0m`),
+  red: (m) => console.error(`\x1b[31m${m}\x1b[0m`),
 };
 
 // --------- OpenAI ---------
 async function callOpenAI(textoLivre) {
-  if (!OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY ausente");
-  }
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY ausente");
 
   const body = {
     model: "gpt-4o-mini",
@@ -70,83 +67,76 @@ async function callOpenAI(textoLivre) {
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
   });
 
   if (!r.ok) {
-    const errText = await r.text().catch(() => "");
-    throw new Error(`OpenAI ${r.status}: ${errText}`);
+    const t = await r.text().catch(() => "");
+    throw new Error(`OpenAI ${r.status}: ${t}`);
   }
 
   const data = await r.json();
   const content = data?.choices?.[0]?.message?.content || "{}";
-  // Tenta parsear o JSON que pedimos
   try {
     return JSON.parse(content);
-  } catch (e) {
+  } catch {
     throw new Error("Falha ao interpretar JSON da OpenAI");
   }
 }
 
-// Fallback extremamente simples (caso OpenAI falhe): detecta alguns itens comuns
+// Fallback rápido se a IA der erro
 function fallbackEstimativa(texto) {
-  const t = texto.toLowerCase();
-
-  const lista = [];
+  const t = (texto || "").toLowerCase();
+  const itens = [];
   let total = 0;
 
-  function add(nome, quant, un, kcalTotal) {
-    lista.push({ nome, quantidade: quant, unidade: un, kcal: kcalTotal });
-    total += kcalTotal;
-  }
+  const add = (nome, q, un, kcal) => {
+    itens.push({ nome, quantidade: q, unidade: un, kcal });
+    total += kcal;
+  };
 
-  // Heurísticas muito básicas (valores médios)
-  const fatiasPao = (t.match(/fatia[s]? de p[aã]o|p[aã]o/gi) ? (parseInt(t.match(/(\d+)\s*(fatia|fatias)/)?.[1] || "2", 10)) : 0);
-  if (fatiasPao > 0) add("pão (fatia)", fatiasPao, "fatia", fatiasPao * 80);
+  // heurísticas simples
+  const fatias = parseInt(t.match(/(\d+)\s*(fatia|fatias)/)?.[1] || (t.includes("pão") ? "2" : "0"), 10);
+  if (fatias > 0) add("pão (fatia)", fatias, "fatia", fatias * 80);
 
   const ovos = parseInt(t.match(/(\d+)\s*ovo[s]?/)?.[1] || (t.includes("ovo") ? "1" : "0"), 10);
   if (ovos > 0) add("ovo", ovos, "un", ovos * 70);
 
-  if (t.includes("café preto") || t.includes("cafe preto") || t.includes("café")) {
-    add("café preto", 1, "xícara", 2);
-  }
+  if (t.includes("café")) add("café preto", 1, "xícara", 2);
 
   return {
-    items: lista,
+    items: itens,
     total_kcal: total,
-    dica_curta: "Hidrate-se e priorize proteínas nas próximas refeições.",
+    dica_curta: "Hidrate-se e priorize proteína magra nas próximas refeições.",
   };
 }
 
-// Monta texto de resposta amigável
-function montarResposta(nomeUsuario, analise) {
-  const itensTxt = analise.items
+function montarResposta(nome, analise) {
+  const itensTxt = (analise.items || [])
     .map(i => `• ${i.nome}: ${i.quantidade} ${i.unidade || ""} ≈ ${i.kcal} kcal`.replace(/\s+/g, " "))
     .join("\n");
 
   const total = analise.total_kcal || 0;
 
-  let msg =
-`Certo${nomeUsuario ? `, ${nomeUsuario}` : ""}! Aqui vai uma estimativa rápida:
+  return `Certo${nome ? `, ${nome}` : ""}! Aqui vai uma estimativa:
 
 ${itensTxt || "• Não consegui identificar itens com segurança 😅"}
 
 ⚖️ *Total estimado*: *${total} kcal*
 💡 ${analise.dica_curta || "Equilibre carboidratos com proteínas para saciedade."}
 
-Se quiser, posso somar o *dia todo*. Me conte também o que rolou nas outras refeições.`;
-
-  return msg;
+Se quiser, posso somar o *dia todo*. Me conte as outras refeições.`;
 }
 
-// --------- WhatsApp (360dialog) ---------
+// --------- Envio WhatsApp (com fallback de rota) ---------
 async function sendWhatsAppText(toWaId, bodyText) {
   if (!D360_API_KEY) throw new Error("D360_API_KEY ausente");
 
-  const payload = {
+  // payload padrão (Meta)
+  const payloadV1 = {
     messaging_product: "whatsapp",
     recipient_type: "individual",
     to: toWaId,
@@ -154,28 +144,61 @@ async function sendWhatsAppText(toWaId, bodyText) {
     text: { preview_url: false, body: bodyText },
   };
 
-  const r = await fetch(D360_SEND, {
+  // payload legacy (360dialog)
+  const payloadLegacy = {
+    to: toWaId,
+    type: "text",
+    text: { body: bodyText },
+  };
+
+  // 1) v1/messages
+  const r1 = await fetch(D360_V1, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "D360-API-KEY": D360_API_KEY,
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payloadV1),
   });
 
-  if (!r.ok) {
-    const err = await r.text().catch(() => "");
-    throw new Error(`Envio 360 falhou ${r.status}: ${err}`);
+  if (r1.ok) {
+    return await r1.json().catch(() => ({}));
+  } else {
+    const err1 = await r1.text().catch(() => "");
+    console.error(
+      `Falha v1/messages ${r1.status}. Payload: ${JSON.stringify(payloadV1)}. Resposta: ${err1}`
+    );
   }
 
-  const data = await r.json().catch(() => ({}));
-  return data;
+  // 2) /messages (legacy) — este já funcionou no seu ambiente
+  const r2 = await fetch(D360_LEGACY, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "D360-API-KEY": D360_API_KEY,
+    },
+    body: JSON.stringify(payloadLegacy),
+  });
+
+  if (r2.ok) {
+    return await r2.json().catch(() => ({}));
+  } else {
+    const err2 = await r2.text().catch(() => "");
+    throw new Error(
+      `Falha legacy /messages ${r2.status}. Payload: ${JSON.stringify(payloadLegacy)}. Resposta: ${err2}`
+    );
+  }
 }
 
 // --------- Webhook ---------
 app.get("/", (_req, res) => {
-  log.blue("🔔 Endpoint 360dialog: " + D360_SEND);
-  log.green("🚀 Kali Nutro IA rodando na porta " + PORT);
+  console.log();
+  console.log("=============================================");
+  console.log("Kali Nutro IA ativo");
+  console.log("Envio primário:", D360_V1);
+  console.log("Fallback legacy:", D360_LEGACY);
+  console.log("=============================================");
+  console.log();
   res.send("OK");
 });
 
@@ -184,28 +207,25 @@ app.post("/webhook", async (req, res) => {
 
   try {
     const body = req.body;
-
-    // Estrutura típica da 360dialog / Meta Webhook
     const change = body?.entry?.[0]?.changes?.[0];
     const value = change?.value;
 
-    // Ignore eventos de status (entregue/lido/failed)
-    const statuses = value?.statuses;
-    if (Array.isArray(statuses) && statuses.length > 0) {
+    // Ignora eventos de status
+    if (Array.isArray(value?.statuses) && value.statuses.length > 0) {
       return res.sendStatus(200);
     }
 
     const msg = value?.messages?.[0];
     const texto = msg?.text?.body?.trim();
-    const from = msg?.from; // wa_id do remetente
+    const from = msg?.from; // wa_id
     const profileName = value?.contacts?.[0]?.profile?.name;
 
     if (!texto || !from) {
-      log.yellow("Webhook sem texto ou remetente identificável.");
+      log.yellow("Webhook sem texto ou remetente.");
       return res.sendStatus(200);
     }
 
-    // Chama IA para entender/estimar
+    // Chama IA
     let analise;
     try {
       analise = await callOpenAI(texto);
@@ -232,5 +252,5 @@ app.post("/webhook", async (req, res) => {
 // --------- Start ---------
 app.listen(PORT, () => {
   log.green(`🚀 Kali Nutro IA rodando na porta ${PORT}`);
-  log.blue(`🔔 Endpoint 360dialog: ${D360_SEND}`);
+  log.blue(`🔔 Endpoint primário: ${D360_V1}`);
 });
