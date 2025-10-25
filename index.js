@@ -1,8 +1,6 @@
-// index.js — Kali Nutro IA (texto + foto)
-// Runtime: Node 18 (CommonJS)
+// index.js — Kali Nutro IA (texto + foto) — usa fetch nativo do Node 18 (sem node-fetch)
 
 const express = require("express");
-const fetch = (...args) => import("node-fetch").then(({default: f}) => f(...args));
 const app = express();
 
 app.use(express.json({ limit: "5mb" }));
@@ -10,12 +8,12 @@ app.use(express.json({ limit: "5mb" }));
 // === ENV ===
 const {
   PORT = 8080,
-  D360_API_KEY,                          // obrigatório para 360dialog
+  D360_API_KEY,                          // obrigatório (360dialog)
   WA_API_BASE = "https://waba-v2.360dialog.io",
-  OPENAI_API_KEY,                        // obrigatório para IA
+  OPENAI_API_KEY,                        // obrigatório (OpenAI)
   OPENAI_MODEL = "gpt-4o-mini",          // texto
   OPENAI_VISION_MODEL = "gpt-4o-mini",   // visão
-  META_WA_CLOUD_TOKEN,                   // opcional fallback para mídia
+  META_WA_CLOUD_TOKEN,                   // opcional (fallback Graph)
 } = process.env;
 
 const SEND_URL_V1 = `${WA_API_BASE}/v1/messages`;
@@ -27,7 +25,7 @@ const log = {
   err:  (...a) => console.error("\x1b[31m%s\x1b[0m", ...a),
 };
 
-// === HELPERS ===
+// === HELPERS (WhatsApp) ===
 async function sendWhatsAppText(to, body) {
   const payload = {
     messaging_product: "whatsapp",
@@ -53,8 +51,8 @@ async function sendWhatsAppText(to, body) {
       throw new Error(`bad_request_${r.status}`);
     }
     return true;
-  } catch (e) {
-    // 2) Fallback /messages (legado) — ainda há rotas que aceitam este caminho
+  } catch {
+    // 2) Fallback /messages (legado)
     try {
       const legacy = `${WA_API_BASE}/messages`;
       const r2 = await fetch(legacy, {
@@ -79,13 +77,11 @@ async function sendWhatsAppText(to, body) {
 }
 
 async function fetchMediaBufferFrom360(mediaId) {
-  // Passo 1: pedir URL de download ao 360
+  // 1) pedir URL de download ao 360
   const meta = await fetch(MEDIA_URL_V1(mediaId), {
     headers: { "D360-API-KEY": D360_API_KEY },
   });
-  if (meta.status === 404) {
-    throw new Error("media_not_found");
-  }
+  if (meta.status === 404) throw new Error("media_not_found");
   if (!meta.ok) {
     const t = await meta.text().catch(() => "");
     throw new Error(`media_meta_error_${meta.status}:${t}`);
@@ -93,16 +89,16 @@ async function fetchMediaBufferFrom360(mediaId) {
   const { url } = await meta.json();
   if (!url) throw new Error("media_url_empty");
 
-  // Passo 2: baixar a URL pública retornada (sem header de auth)
+  // 2) baixar arquivo público
   const bin = await fetch(url);
   if (!bin.ok) throw new Error(`media_download_${bin.status}`);
-  const buf = await bin.arrayBuffer();
-  return Buffer.from(buf);
+  const buf = Buffer.from(await bin.arrayBuffer());
+  return buf;
 }
 
 async function fetchMediaBufferFallbackGraph(mediaId) {
   if (!META_WA_CLOUD_TOKEN) throw new Error("no_graph_token");
-  // Graph: 1) pegar URL
+  // 1) pegar URL no Graph
   const meta = await fetch(`https://graph.facebook.com/v20.0/${mediaId}`, {
     headers: { Authorization: `Bearer ${META_WA_CLOUD_TOKEN}` },
   });
@@ -115,8 +111,7 @@ async function fetchMediaBufferFallbackGraph(mediaId) {
   // 2) baixar
   const bin = await fetch(url);
   if (!bin.ok) throw new Error(`graph_download_${bin.status}`);
-  const buf = await bin.arrayBuffer();
-  return Buffer.from(buf);
+  return Buffer.from(await bin.arrayBuffer());
 }
 
 // === IA (OpenAI) ===
@@ -133,12 +128,12 @@ async function askOpenAIText(prompt) {
         {
           role: "system",
           content:
-            "Você é a Kali, assistente de nutrologia focada em dieta. Seja objetiva, educada e prática. Calcule calorias aproximadas de refeições em PT-BR e ofereça 1 dica curta e útil.",
+            "Você é a Kali, assistente de nutrologia focada em dieta. Seja objetiva, educada e prática. Calcule calorias aproximadas em PT-BR e ofereça 1 dica curta.",
         },
         {
           role: "user",
           content:
-            "Formate assim:\nItens:\n• item: qtd/unidade ≈ kcal\nTotal: X kcal\nDica: ...",
+            "Formate exatamente assim:\nItens:\n• item: qtd/unidade ≈ kcal\nTotal: X kcal\nDica: ...",
         },
         { role: "user", content: prompt },
       ],
@@ -149,7 +144,9 @@ async function askOpenAIText(prompt) {
     throw new Error(`openai_text_${r.status}:${t}`);
   }
   const j = await r.json();
-  return j.output_text?.trim() || j.output?.[0]?.content?.[0]?.text?.trim() || "Não consegui calcular agora.";
+  return j.output_text?.trim() ||
+         j.output?.[0]?.content?.[0]?.text?.trim() ||
+         "Não consegui calcular agora.";
 }
 
 async function askOpenAIVision(buffer) {
@@ -174,13 +171,9 @@ async function askOpenAIVision(buffer) {
             {
               type: "input_text",
               text:
-                "Analise a imagem dos alimentos e responda assim:\nItens:\n• alimento: quantidade estimada ≈ kcal\nTotal: X kcal\nDica: ...\nSe estiver incerto, assuma quantidades médias e sinalize com '~'.",
+                "Analise a imagem e responda assim:\nItens:\n• alimento: quantidade estimada ≈ kcal\nTotal: X kcal\nDica: ...\nSe estiver incerto, use '~' e assuma porções médias.",
             },
-            {
-              type: "input_image",
-              image_data: base64,
-              mime_type: "image/jpeg",
-            },
+            { type: "input_image", image_data: base64, mime_type: "image/jpeg" },
           ],
         },
       ],
@@ -191,25 +184,27 @@ async function askOpenAIVision(buffer) {
     throw new Error(`openai_vision_${r.status}:${t}`);
   }
   const j = await r.json();
-  return j.output_text?.trim() || j.output?.[0]?.content?.[0]?.text?.trim() || "Não consegui analisar a imagem agora.";
+  return j.output_text?.trim() ||
+         j.output?.[0]?.content?.[0]?.text?.trim() ||
+         "Não consegui analisar a imagem agora.";
 }
 
 // === WEBHOOK ===
 app.post("/webhook", async (req, res) => {
   log.info("🟦 Webhook recebido");
-  res.sendStatus(200); // responde rápido pro WhatsApp
+  res.sendStatus(200); // responde rápido
 
   try {
     const entry = req.body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value;
 
-    // 1) Mensagens de usuário
     const msg = value?.messages?.[0];
     const from = msg?.from || value?.contacts?.[0]?.wa_id;
 
+    // TEXTO
     if (msg?.type === "text" && msg?.text?.body && from) {
-      const text = msg.text.body.trim();
+      const text = (msg.text.body || "").trim();
       let reply;
       try {
         reply = await askOpenAIText(text);
@@ -221,32 +216,25 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // 2) Imagem
+    // IMAGEM
     if (msg?.type === "image" && from) {
       const mediaId = msg.image?.id || msg.image?.media_id;
       if (!mediaId) {
         await sendWhatsAppText(from, "Não recebi o identificador da imagem. Pode tentar novamente? 🙏");
         return;
       }
-
       try {
         let buf;
         try {
           buf = await fetchMediaBufferFrom360(String(mediaId));
         } catch (e1) {
           log.err("Falha 360 ao baixar mídia:", e1.message);
-          // fallback Graph se disponível
           if (META_WA_CLOUD_TOKEN) {
-            try {
-              buf = await fetchMediaBufferFallbackGraph(String(mediaId));
-            } catch (e2) {
-              throw e2;
-            }
+            buf = await fetchMediaBufferFallbackGraph(String(mediaId));
           } else {
             throw e1;
           }
         }
-
         const answer = await askOpenAIVision(buf);
         await sendWhatsAppText(from, answer);
       } catch (e) {
@@ -256,7 +244,7 @@ app.post("/webhook", async (req, res) => {
       return;
     }
 
-    // 3) Outros tipos / sem texto
+    // OUTROS
     if (from) {
       await sendWhatsAppText(
         from,
@@ -268,11 +256,11 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// === STATUS / HEALTH ===
+// HEALTH
 app.get("/", (_, res) => res.send("Kali Nutro IA ✅"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// === START ===
+// START
 app.listen(PORT, () => {
   log.info(`🔔 Endpoint primário: ${SEND_URL_V1}`);
   log.ok(`🚀 Kali Nutro IA rodando na porta ${PORT}`);
