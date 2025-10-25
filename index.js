@@ -15,7 +15,7 @@ const D360_API_KEY = process.env.D360_API_KEY;
 
 const D360_BASE = "https://waba-v2.360dialog.io";
 const D360_V1 = `${D360_BASE}/v1/messages`;   // novo
-const D360_LEGACY = `${D360_BASE}/messages`;   // fallback (este já deu 200 nos seus logs)
+const D360_LEGACY = `${D360_BASE}/messages`;   // fallback
 
 const NUTRO_SYSTEM = `
 Você é a *Kali*, assistente de nutrologia focada em dieta e calorias.
@@ -98,7 +98,6 @@ function fallbackEstimativa(texto) {
     total += kcal;
   };
 
-  // heurísticas simples
   const fatias = parseInt(t.match(/(\d+)\s*(fatia|fatias)/)?.[1] || (t.includes("pão") ? "2" : "0"), 10);
   if (fatias > 0) add("pão (fatia)", fatias, "fatia", fatias * 80);
 
@@ -135,20 +134,25 @@ Se quiser, posso somar o *dia todo*. Me conte as outras refeições.`;
 async function sendWhatsAppText(toWaId, bodyText) {
   if (!D360_API_KEY) throw new Error("D360_API_KEY ausente");
 
-  // payload padrão (Meta)
+  // Componente de texto limitado (evita 400 por corpo vazio ou muito longo)
+  const bodySafe = String(bodyText || "").slice(0, 4000) || " ";
+
+  // payload padrão (Meta) — mantém preview_url false
   const payloadV1 = {
     messaging_product: "whatsapp",
     recipient_type: "individual",
     to: toWaId,
     type: "text",
-    text: { preview_url: false, body: bodyText },
+    text: { preview_url: false, body: bodySafe },
   };
 
-  // payload legacy (360dialog)
+  // payload legacy exigindo messaging_product no seu ambiente
   const payloadLegacy = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
     to: toWaId,
     type: "text",
-    text: { body: bodyText },
+    text: { body: bodySafe },
   };
 
   // 1) v1/messages
@@ -156,6 +160,7 @@ async function sendWhatsAppText(toWaId, bodyText) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "Accept": "application/json",
       "D360-API-KEY": D360_API_KEY,
     },
     body: JSON.stringify(payloadV1),
@@ -170,11 +175,12 @@ async function sendWhatsAppText(toWaId, bodyText) {
     );
   }
 
-  // 2) /messages (legacy) — este já funcionou no seu ambiente
+  // 2) /messages (legacy)
   const r2 = await fetch(D360_LEGACY, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      "Accept": "application/json",
       "D360-API-KEY": D360_API_KEY,
     },
     body: JSON.stringify(payloadLegacy),
