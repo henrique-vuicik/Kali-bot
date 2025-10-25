@@ -1,4 +1,4 @@
-// index.js — Kali Nutro IA (texto + imagem) com download robusto de mídia 360dialog
+// index.js — Kali Nutro IA (texto + imagem) com fallback de envio 360dialog
 // Node 18+ (fetch global). CommonJS.
 
 const express = require("express");
@@ -8,7 +8,7 @@ app.use(express.json({ limit: "25mb" }));
 
 // ==== ENV ====
 const PORT = process.env.PORT || 8080;
-const D360_API = "https://waba-v2.360dialog.io";
+const D360_API_BASE = "https://waba-v2.360dialog.io";
 const D360_KEY = process.env.D360_API_KEY;     // obrigatório
 const OPENAI_KEY = process.env.OPENAI_API_KEY; // obrigatório
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
@@ -20,67 +20,109 @@ const log = {
   err:  (...a) => console.error("\x1b[31m%s\x1b[0m", a.join(" ")),
 };
 
-// ==== Envio WhatsApp (usa v1/messages) ====
+// ==== Envio WhatsApp (com 3 tentativas) ====
 async function sendWhatsAppText(to, body) {
-  const payload = {
-    messaging_product: "whatsapp",
-    recipient_type: "individual",
+  const common = {
     to,
     type: "text",
     text: { preview_url: false, body }
   };
-  const url = `${D360_API}/v1/messages`;
-  const r = await fetch(url, {
+
+  // 1) Endpoint v2 oficial
+  const payloadV2 = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    ...common
+  };
+  const urlV2 = `${D360_API_BASE}/v1/messages`;
+  let r = await fetch(urlV2, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "D360-API-KEY": D360_KEY
     },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payloadV2)
   });
-  if (!r.ok) {
-    const txt = await r.text().catch(() => "");
-    throw new Error(`Falha v1/messages ${r.status}. Payload: ${JSON.stringify(payload)}. Resposta: ${txt}`);
+
+  if (r.ok) return r.json();
+
+  const textV2 = await r.text().catch(() => "");
+  log.err(`Falha v1/messages ${r.status}. Payload: ${JSON.stringify(payloadV2)}. Resposta: ${textV2}`);
+
+  // Se for 400 genérico, tenta legacy com messaging_product
+  if (r.status === 400) {
+    const urlLegacy = `${D360_API_BASE}/messages`;
+    const payloadLegacy = {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      ...common
+    };
+    r = await fetch(urlLegacy, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "D360-API-KEY": D360_KEY
+      },
+      body: JSON.stringify(payloadLegacy)
+    });
+
+    if (r.ok) return r.json();
+
+    const textLegacy = await r.text().catch(() => "");
+    log.err(`Falha legacy /messages ${r.status}. Payload: ${JSON.stringify(payloadLegacy)}. Resposta: ${textLegacy}`);
+
+    // 3) Última cartada: legacy sem messaging_product (algumas rotas antigas aceitam)
+    const payloadLegacyOld = { ...common };
+    r = await fetch(urlLegacy, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "D360-API-KEY": D360_KEY
+      },
+      body: JSON.stringify(payloadLegacyOld)
+    });
+    if (r.ok) return r.json();
+
+    const textLegacyOld = await r.text().catch(() => "");
+    throw new Error(`Falha legacy (sem messaging_product) ${r.status}. Payload: ${JSON.stringify(payloadLegacyOld)}. Resposta: ${textLegacyOld}`);
   }
-  return r.json();
+
+  // Se não era 400, propaga erro
+  throw new Error(`Falha v1/messages ${r.status}. Payload: ${JSON.stringify(payloadV2)}. Resposta: ${textV2}`);
 }
 
 // ==== Baixar mídia do 360dialog (tenta 3 formas) =====
 async function downloadMediaBase64(mediaId) {
-  // helper para converter binário em data URL
   const toDataUrl = async (resp) => {
     const ct = resp.headers.get("content-type") || "image/jpeg";
     const buf = Buffer.from(await resp.arrayBuffer());
     return `data:${ct};base64,${buf.toString("base64")}`;
   };
 
-  // Tentativa A: GET /v1/media/{id} pode devolver diretamente o binário
-  let resp = await fetch(`${D360_API}/v1/media/${mediaId}`, {
+  // A) /v1/media/{id} -> pode ser binário ou JSON com {url}
+  let resp = await fetch(`${D360_API_BASE}/v1/media/${mediaId}`, {
     headers: { "D360-API-KEY": D360_KEY }
   });
   if (resp.ok) {
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
-    if (!ct.includes("application/json")) {
-      return toDataUrl(resp);
-    }
-    // pode ser JSON com { url: "..." }
+    if (!ct.includes("application/json")) return toDataUrl(resp);
     try {
       const j = await resp.json();
       if (j.url) {
         const r2 = await fetch(j.url, { headers: { "D360-API-KEY": D360_KEY } });
         if (r2.ok) return toDataUrl(r2);
       }
-    } catch { /* segue para tentativa B */ }
+    } catch {}
   }
 
-  // Tentativa B: rota alternativa com /content
-  resp = await fetch(`${D360_API}/v1/media/${mediaId}/content`, {
+  // B) /v1/media/{id}/content
+  resp = await fetch(`${D360_API_BASE}/v1/media/${mediaId}/content`, {
     headers: { "D360-API-KEY": D360_KEY }
   });
   if (resp.ok) return toDataUrl(resp);
 
-  // Tentativa C: às vezes /v1/media/{id} retorna 302 com Location
-  resp = await fetch(`${D360_API}/v1/media/${mediaId}`, {
+  // C) redirecionamento manual
+  resp = await fetch(`${D360_API_BASE}/v1/media/${mediaId}`, {
     headers: { "D360-API-KEY": D360_KEY },
     redirect: "manual"
   });
@@ -92,12 +134,11 @@ async function downloadMediaBase64(mediaId) {
     }
   }
 
-  // Se chegou aqui, falhou geral: pega último texto para log
   const lastTxt = await resp.text().catch(() => "");
   throw new Error(`Falha ao baixar mídia ${mediaId}: ${resp.status} ${lastTxt}`);
 }
 
-// ==== OpenAI: texto -> calorias ====
+// ==== OpenAI (texto) ====
 async function openaiCaloriesFromText(userText) {
   const system = `
 Você é uma assistente de nutrologia que estima calorias com base em
@@ -135,7 +176,7 @@ Dica: <dica curta>
   return out.trim();
 }
 
-// ==== OpenAI: imagem -> descrição + calorias ====
+// ==== OpenAI (imagem) ====
 async function openaiCaloriesFromImage(dataUrl) {
   const system = `
 Você é uma assistente de nutrologia. Dada a foto de um prato, identifique
@@ -178,11 +219,10 @@ Dica: <dica curta>
   return out.trim();
 }
 
-// ==== Webhook raiz ====
+// ==== Webhook ====
 app.get("/", (_, res) => res.send("Kali Nutro IA OK"));
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200); // responde rápido ao WhatsApp
-
+  res.sendStatus(200);
   try {
     log.info("🟦 Webhook recebido");
     const change = req.body?.entry?.[0]?.changes?.[0]?.value;
@@ -191,10 +231,10 @@ app.post("/webhook", async (req, res) => {
     const msg = change.messages?.[0];
     if (!msg) return;
 
-    const from = msg.from; // número do cliente
+    const from = msg.from;
     if (!from) return;
 
-    // === IMAGEM ===
+    // IMAGEM
     if (msg.type === "image") {
       const mediaId = msg.image?.id || msg.image?.media_id || msg.image?.mediaId;
       if (mediaId) {
@@ -210,7 +250,7 @@ app.post("/webhook", async (req, res) => {
       }
     }
 
-    // === TEXTO ===
+    // TEXTO
     let userText = null;
     if (msg.type === "text") userText = msg.text?.body || null;
 
@@ -231,16 +271,11 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// Envio “silencioso” para não quebrar o webhook
 async function safeReply(to, text) {
-  try {
-    await sendWhatsAppText(to, text);
-  } catch (e) {
-    log.err(e.message);
-  }
+  try { await sendWhatsAppText(to, text); } catch (e) { log.err(e.message); }
 }
 
 app.listen(PORT, () => {
-  log.info(`🔔 Endpoint primário: ${D360_API}/v1/messages`);
+  log.info(`🔔 Endpoint primário: ${D360_API_BASE}/v1/messages`);
   log.ok(`🚀 Kali Nutro IA rodando na porta ${PORT}`);
 });
