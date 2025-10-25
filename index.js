@@ -1,147 +1,112 @@
-// index.js - 360dialog v2 + fallback (CommonJS)
+import express from "express";
+import bodyParser from "body-parser";
+import fetch from "node-fetch";
 
-const express = require('express');
-const axios = require('axios');
-const bodyParser = require('body-parser');
-
-// ---------- ENV ----------
-const PORT = process.env.PORT || 8080;
-const D360_API_KEY = process.env.D360_API_KEY || process.env.D360_APIKEY || process.env.D360_API || '';
-const TEST_TO = process.env.TEST_TO || '';
-const WHATSAPP_FROM = process.env.WHATSAPP_FROM || ''; // ex.: 554291251751 (sem +)
-
-// Endpoints 360dialog
-const BASE_V2 = 'https://waba-v2.360dialog.io';
-const URL_V2_MESSAGES = `${BASE_V2}/v1/messages`;
-// Endpoint “legacy” (proxy Graph) — ainda útil para comparar erros
-const URL_LEGACY_MESSAGES = `${BASE_V2}/messages`;
-
-// ---------- APP ----------
 const app = express();
 app.use(bodyParser.json());
 
-// ---------- HELPERS ----------
-const headers = () => ({
-  'D360-API-KEY': D360_API_KEY,
-  'Content-Type': 'application/json',
-  'Accept': 'application/json'
-});
+// Variáveis de ambiente (Railway)
+const PORT = process.env.PORT || 8080;
+const D360_API_KEY = process.env.D360_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-function buildTextPayload(to, text) {
-  // payload Cloud API compatível (inclui messaging_product)
-  const payload = {
-    messaging_product: 'whatsapp',
-    recipient_type: 'individual',
-    to: String(to),
-    type: 'text',
-    text: {
-      preview_url: false,
-      body: text
-    }
+// Endpoint padrão do 360dialog
+const ENDPOINT_360 = "https://waba-v2.360dialog.io/v1/messages";
+
+// Função simples de log
+function log(color, msg, data = null) {
+  const colors = {
+    blue: "\x1b[34m",
+    green: "\x1b[32m",
+    yellow: "\x1b[33m",
+    red: "\x1b[31m",
+    reset: "\x1b[0m",
   };
-  if (WHATSAPP_FROM) payload.from = String(WHATSAPP_FROM);
-  return payload;
+  console.log(`${colors[color] || ""}${msg}${colors.reset}`);
+  if (data) console.log(data);
 }
 
-async function trySendVariations(to, text, tag = 'envio') {
-  const body = buildTextPayload(to, text);
+// Endpoint base (teste rápido)
+app.get("/", (_, res) => res.send("✅ Kali Nutro IA está online e saudável! 🥦💪"));
 
-  // 1) v2 padrão
+// Webhook principal do WhatsApp
+app.post("/webhook", async (req, res) => {
+  log("blue", "🟦 Webhook recebido");
+
+  const message = req.body.messages?.[0];
+  if (!message) return res.sendStatus(200);
+
+  const from = message.from;
+  const text = message.text?.body || "";
+  log("green", `🟩 Mensagem recebida de ${from}: ${text}`);
+
+  // Prompt base com contexto da Kali
+  const promptBase = `
+  Você é **Kali**, uma assistente virtual de nutrologia da clínica do Dr. Henrique Vuicik.
+  Seu papel é ajudar os pacientes a **monitorar a dieta, planejar refeições e entender o valor calórico dos alimentos**.
+  - Fale de forma simpática, objetiva e encorajadora.  
+  - Evite jargões médicos; use linguagem leiga e próxima.  
+  - Dê **dicas práticas de alimentação** (ex: "troque pão por tapioca", "evite industrializados").  
+  - Se o paciente mencionar refeições, calcule **estimativas de calorias**.  
+  - Mantenha sempre o foco em **hábitos saudáveis, controle calórico e proteínas**.  
+  - Caso o texto não seja sobre nutrição, responda brevemente e redirecione para alimentação.  
+  Usuário: ${text}
+  `;
+
+  let respostaIA = "Desculpe, estou processando sua mensagem...";
+
+  // Geração da resposta com OpenAI
   try {
-    console.log(`🟦 Enviando via: v1/messages (v2 360) -> ${URL_V2_MESSAGES} ${JSON.stringify(body)}`);
-    const r = await axios.post(URL_V2_MESSAGES, body, { headers: headers(), timeout: 15000 });
-    console.log(`🟩 OK ${r.status} em "v1/messages (v2 360)" ${JSON.stringify(r.data)}`);
-    return { ok: true, data: r.data };
-  } catch (e) {
-    const status = e.response?.status ?? 'ERR';
-    const data = e.response?.data ?? e.message;
-    console.log(`🟥 Falha ${status} em "v1/messages (v2 360)" ${JSON.stringify(data)}`);
-  }
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-5",
+        input: promptBase,
+      }),
+    });
 
-  // 2) legacy (proxy Graph) — inclui também messaging_product (é requisito do Graph)
-  try {
-    console.log(`🟦 Enviando via: /messages (legacy) -> ${URL_LEGACY_MESSAGES} ${JSON.stringify(body)}`);
-    const r2 = await axios.post(URL_LEGACY_MESSAGES, body, { headers: headers(), timeout: 15000 });
-    console.log(`🟩 OK ${r2.status} em "messages (legacy)" ${JSON.stringify(r2.data)}`);
-    return { ok: true, data: r2.data };
-  } catch (e2) {
-    const status = e2.response?.status ?? 'ERR';
-    const data = e2.response?.data ?? e2.message;
-    console.log(`🟥 Falha ${status} em "messages (legacy)" ${JSON.stringify(data)}`);
-  }
-
-  return { ok: false, error: 'Todas as variações falharam. Veja os logs acima.' };
-}
-
-// ---------- WEBHOOK ----------
-app.post('/webhook', async (req, res) => {
-  console.log('🟦 Webhook recebido');
-
-  try {
-    // Tenta normalizar formatos 360/Graph
-    const body = req.body || {};
-    let from, text;
-
-    // 360 v2 (webhook padrão 360)
-    if (body.from && body.text) {
-      from = body.from;
-      text = body.text;
-    }
-
-    // Meta Cloud (formato de entry/changes)
-    if (!from || !text) {
-      const changes = body.entry?.[0]?.changes?.[0]?.value;
-      const msg = changes?.messages?.[0];
-      if (msg?.from && msg?.text?.body) {
-        from = msg.from;
-        text = msg.text.body;
-      }
-    }
-
-    if (!from || !text) {
-      console.log(`🟨 Webhook sem texto ou remetente identificável: ${JSON.stringify(req.body)}`);
-      return res.sendStatus(200);
-    }
-
-    console.log(`🟩 Mensagem recebida de ${from}: ${text}`);
-
-    const reply = `Recebido: ${text}`;
-    const sent = await trySendVariations(from, reply, 'resposta');
-
-    if (!sent.ok) {
-      console.log(`🟥 Erro ao enviar resposta ${JSON.stringify(sent)}`);
-    }
-    return res.sendStatus(200);
+    const data = await response.json();
+    respostaIA = data.output?.[0]?.content?.[0]?.text?.trim() || "Não consegui entender 😅";
+    log("yellow", `🧠 Resposta IA: ${respostaIA}`);
   } catch (err) {
-    console.log('🟥 Erro no webhook', err?.message || err);
-    return res.sendStatus(200);
+    log("red", "Erro ao consultar IA", err);
   }
+
+  // Envio da resposta pelo WhatsApp
+  try {
+    const resp = await fetch(ENDPOINT_360, {
+      method: "POST",
+      headers: {
+        "D360-API-KEY": D360_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: from,
+        type: "text",
+        text: { body: respostaIA },
+      }),
+    });
+
+    const result = await resp.text();
+    if (resp.ok) log("green", "✅ Resposta enviada com sucesso!");
+    else log("red", `Erro ao enviar mensagem: ${result}`);
+  } catch (err) {
+    log("red", "Falha ao enviar mensagem", err);
+  }
+
+  res.sendStatus(200);
 });
 
-// ---------- HEALTH ----------
-app.get('/', (_req, res) => res.send('OK'));
-
-// ---------- START ----------
-app.listen(PORT, async () => {
-  console.log(`🟩 🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`🟦 🔔 Endpoint 360dialog: ${URL_V2_MESSAGES}`);
-
-  if (!D360_API_KEY) {
-    console.log('🟨 Falta D360_API_KEY nos variables do Railway!');
-    return;
-  }
-
-  if (TEST_TO) {
-    try {
-      console.log('🟦 🔎 Rodando teste de envio inicial…');
-      const r = await trySendVariations(TEST_TO, 'Teste automático ✅', 'teste');
-      if (!r.ok) {
-        console.log(`🟥 Teste automático FALHOU ${JSON.stringify(r)}`);
-      }
-    } catch (e) {
-      console.log('🟥 Erro no teste automático', e?.response?.data || e.message);
-    }
-  } else {
-    console.log('🟦 Teste automático não executado (defina TEST_TO e D360_API_KEY).');
-  }
+// Inicialização do servidor
+app.listen(PORT, () => {
+  log("green", `🚀 Kali Nutro IA rodando na porta ${PORT}`);
+  log("blue", `🔔 Endpoint 360dialog: ${ENDPOINT_360}`);
+  if (!D360_API_KEY) log("yellow", "⚠️ Falta D360_API_KEY nas variáveis do Railway!");
+  if (!OPENAI_API_KEY) log("yellow", "⚠️ Falta OPENAI_API_KEY nas variáveis do Railway!");
 });
