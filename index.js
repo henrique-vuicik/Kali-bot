@@ -1,6 +1,5 @@
 const express = require("express");
 const bodyParser = require("body-parser");
-const fetch = require("node-fetch");
 
 const app = express();
 app.use(bodyParser.json());
@@ -13,7 +12,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 // Endpoint padrão do 360dialog
 const ENDPOINT_360 = "https://waba-v2.360dialog.io/v1/messages";
 
-// Função simples de log
+// Função simples de log colorido
 function log(color, msg, data = null) {
   const colors = {
     blue: "\x1b[34m",
@@ -26,10 +25,10 @@ function log(color, msg, data = null) {
   if (data) console.log(data);
 }
 
-// Endpoint base (teste rápido)
+// Teste rápido
 app.get("/", (_, res) => res.send("✅ Kali Nutro IA está online e saudável! 🥦💪"));
 
-// Webhook principal do WhatsApp
+// Webhook do WhatsApp
 app.post("/webhook", async (req, res) => {
   log("blue", "🟦 Webhook recebido");
 
@@ -40,7 +39,7 @@ app.post("/webhook", async (req, res) => {
   const text = message.text?.body || "";
   log("green", `🟩 Mensagem recebida de ${from}: ${text}`);
 
-  // Prompt base com contexto da Kali
+  // Prompt da Kali (contexto Nutrologia)
   const promptBase = `
   Você é **Kali**, uma assistente virtual de nutrologia da clínica do Dr. Henrique Vuicik.
   Seu papel é ajudar os pacientes a **monitorar a dieta, planejar refeições e entender o valor calórico dos alimentos**.
@@ -55,7 +54,7 @@ app.post("/webhook", async (req, res) => {
 
   let respostaIA = "Desculpe, estou processando sua mensagem...";
 
-  // Geração da resposta com OpenAI
+  // 🔹 Chamada à API OpenAI
   try {
     const response = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -76,7 +75,7 @@ app.post("/webhook", async (req, res) => {
     log("red", "Erro ao consultar IA", err);
   }
 
-  // Envio da resposta pelo WhatsApp
+  // 🔹 Envio da resposta pelo WhatsApp
   try {
     const resp = await fetch(ENDPOINT_360, {
       method: "POST",
