@@ -1,219 +1,236 @@
+// index.js
+// Kali Nutro IA – WhatsApp (360dialog) + OpenAI
+// Requisitos de ambiente: OPENAI_API_KEY, D360_API_KEY
+// Node 18+ (tem fetch nativo). Sem node-fetch.
+
 const express = require("express");
-const bodyParser = require("body-parser");
+const crypto = require("crypto");
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json({ limit: "1mb" }));
 
-// ---------- ENV ----------
+// ===== Config =====
 const PORT = process.env.PORT || 8080;
-const D360_API_KEY = process.env.D360_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const ENDPOINT_360 = "https://waba-v2.360dialog.io/messages";
-const DEFAULT_GOAL = Number(process.env.NUTRO_GOAL_KCAL || 2000);
-const TZ = process.env.TIMEZONE || "America/Sao_Paulo";
+const D360_API_KEY = process.env.D360_API_KEY;
+const D360_BASE = "https://waba-v2.360dialog.io";
+const D360_SEND = `${D360_BASE}/v1/messages`;
 
-// ---------- LOG ----------
-function log(color, msg, data = null) {
-  const colors = { blue: "\x1b[34m", green: "\x1b[32m", yellow: "\x1b[33m", red: "\x1b[31m", reset: "\x1b[0m" };
-  console.log(`${colors[color] || ""}${msg}${colors.reset}`);
-  if (data) console.log(typeof data === "string" ? data : JSON.stringify(data, null, 2));
+const NUTRO_SYSTEM = `
+Você é a *Kali*, assistente de nutrologia focada em dieta e calorias.
+Tarefas:
+1) Interpretar texto livre em PT-BR sobre o que a pessoa comeu/bebeu.
+2) Extrair itens com quantidade e unidade (quando possível).
+3) Estimar *calorias por item* e *total*, com base em tabelas nutricionais comuns (valores médios, ok supor ranges).
+4) Retornar *apenas JSON* no formato abaixo, sem texto fora do JSON:
+
+{
+  "items":[
+    {"nome":"pão francês", "quantidade":2, "unidade":"fatia", "kcal":160},
+    {"nome":"ovo", "quantidade":1, "unidade":"un", "kcal":70},
+    {"nome":"café preto", "quantidade":1, "unidade":"xícara", "kcal":2}
+  ],
+  "total_kcal":232,
+  "dica_curta":"Combine proteína magra em próximas refeições para maior saciedade."
 }
 
-// ---------- STATE (memória em RAM) ----------
-/*
-state = {
-  "<wa_id>": {
-    goal: 2000,
-    days: {
-      "2025-10-25": { total: 730, items: [ { text:"2 ovos…", kcal: 300 }, ... ] }
-    }
+Regras:
+- Se o usuário não informar quantidade, estimar o *típico* (ex.: 1 xícara, 1 unidade, 100 g).
+- Se algo for ambiguo, escolha o mais comum no Brasil.
+- Não invente pratos não citados.
+- Sempre some as calorias e preencha "total_kcal".
+- "dica_curta" até 140 caracteres, prática e em linguagem simples.
+`;
+
+// --------- Utilidades ---------
+const log = {
+  info: (msg) => console.log(msg),
+  blue: (msg) => console.log(`\x1b[34m${msg}\x1b[0m`),
+  green: (msg) => console.log(`\x1b[32m${msg}\x1b[0m`),
+  red: (msg) => console.error(`\x1b[31m${msg}\x1b[0m`),
+  yellow: (msg) => console.warn(`\x1b[33m${msg}\x1b[0m`),
+};
+
+// --------- OpenAI ---------
+async function callOpenAI(textoLivre) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY ausente");
   }
-}
-*/
-const state = Object.create(null);
-const todayKey = () => new Date().toLocaleDateString("en-CA", { timeZone: TZ }); // YYYY-MM-DD
 
-function getUser(wa_id) {
-  if (!state[wa_id]) state[wa_id] = { goal: DEFAULT_GOAL, days: {} };
-  const key = todayKey();
-  if (!state[wa_id].days[key]) state[wa_id].days[key] = { total: 0, items: [] };
-  return { user: state[wa_id], day: state[wa_id].days[key], key };
-}
-
-// ---------- 360 helpers ----------
-function extractMessage(body) {
-  const value = body?.entry?.[0]?.changes?.[0]?.value;
-  const msg = value?.messages?.[0];
-  if (msg?.text?.body && msg?.from) {
-    return { from: msg.from, text: msg.text.body.trim() };
-  }
-  return null;
-}
-
-async function sendMessage(to, text) {
-  try {
-    const payload = {
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to,
-      type: "text",
-      text: { body: text },
-    };
-
-    const r = await fetch(ENDPOINT_360, {
-      method: "POST",
-      headers: { "D360-API-KEY": D360_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    const resp = await r.text();
-    if (r.ok) log("green", "✅ Resposta enviada!");
-    else log("red", `❌ Erro 360dialog ${r.status}`, resp);
-  } catch (err) {
-    log("red", "❌ Erro ao enviar mensagem", err);
-  }
-}
-
-// ---------- OpenAI ----------
-async function openaiJSON(prompt) {
-  // pedimos JSON estrito e robustecemos o parser
   const body = {
-    model: "gpt-5",
-    input:
-      `Você é a **Kali**, assistente de nutrologia. ` +
-      `Dado o texto do paciente, estime as calorias totais (kcal) e descreva um breve racional. ` +
-      `Retorne **apenas** JSON no formato: {"kcal": <number>, "detalhe": "<string>"}.\n\n` +
-      `Texto: "${prompt}"`,
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: NUTRO_SYSTEM },
+      { role: "user", content: textoLivre },
+    ],
+    temperature: 0.2,
+    response_format: { type: "json_object" },
   };
 
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    throw new Error(`OpenAI ${r.status}: ${errText}`);
+  }
+
+  const data = await r.json();
+  const content = data?.choices?.[0]?.message?.content || "{}";
+  // Tenta parsear o JSON que pedimos
   try {
-    const r = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await r.json();
-    log("yellow", "🧠 OpenAI raw:", data);
-
-    // Tenta várias formas de extrair texto
-    const candidates = [
-      data.output?.[0]?.content?.[0]?.text,
-      data.choices?.[0]?.message?.content,
-      data.choices?.[0]?.text,
-      typeof data === "string" ? data : null,
-    ].filter(Boolean);
-
-    const raw = candidates.find((t) => typeof t === "string" && t.trim());
-    if (!raw) throw new Error("Sem texto na resposta da OpenAI");
-
-    // Puxa o primeiro bloco JSON válido
-    const start = raw.indexOf("{");
-    const end = raw.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start) throw new Error("JSON não encontrado no texto");
-    const json = JSON.parse(raw.slice(start, end + 1));
-
-    const kcal = Number(json.kcal);
-    const detalhe = String(json.detalhe || "").trim();
-    if (!isFinite(kcal)) throw new Error("kcal inválido");
-    return { kcal: Math.max(0, Math.round(kcal)), detalhe };
+    return JSON.parse(content);
   } catch (e) {
-    log("red", "❌ Falha ao interpretar JSON da OpenAI", e.message || e);
-    return null;
+    throw new Error("Falha ao interpretar JSON da OpenAI");
   }
 }
 
-// ---------- NLP simples de comandos ----------
-function parseCommand(text) {
-  const t = text.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "");
-  if (/\b(total|saldo|resumo|quanto deu|quanto falta)\b/.test(t)) return { type: "total" };
-  if (/\b(zerar|resetar|apagar|limpar)\b/.test(t)) return { type: "reset" };
-  const metaMatch = t.match(/\bmeta\s+(\d{3,4})\b/);
-  if (metaMatch) return { type: "set_goal", goal: Number(metaMatch[1]) };
-  return { type: "meal" };
+// Fallback extremamente simples (caso OpenAI falhe): detecta alguns itens comuns
+function fallbackEstimativa(texto) {
+  const t = texto.toLowerCase();
+
+  const lista = [];
+  let total = 0;
+
+  function add(nome, quant, un, kcalTotal) {
+    lista.push({ nome, quantidade: quant, unidade: un, kcal: kcalTotal });
+    total += kcalTotal;
+  }
+
+  // Heurísticas muito básicas (valores médios)
+  const fatiasPao = (t.match(/fatia[s]? de p[aã]o|p[aã]o/gi) ? (parseInt(t.match(/(\d+)\s*(fatia|fatias)/)?.[1] || "2", 10)) : 0);
+  if (fatiasPao > 0) add("pão (fatia)", fatiasPao, "fatia", fatiasPao * 80);
+
+  const ovos = parseInt(t.match(/(\d+)\s*ovo[s]?/)?.[1] || (t.includes("ovo") ? "1" : "0"), 10);
+  if (ovos > 0) add("ovo", ovos, "un", ovos * 70);
+
+  if (t.includes("café preto") || t.includes("cafe preto") || t.includes("café")) {
+    add("café preto", 1, "xícara", 2);
+  }
+
+  return {
+    items: lista,
+    total_kcal: total,
+    dica_curta: "Hidrate-se e priorize proteínas nas próximas refeições.",
+  };
 }
 
-// ---------- Motor principal ----------
-async function handleMeal(wa, userText) {
-  const { user, day, key } = getUser(wa);
+// Monta texto de resposta amigável
+function montarResposta(nomeUsuario, analise) {
+  const itensTxt = analise.items
+    .map(i => `• ${i.nome}: ${i.quantidade} ${i.unidade || ""} ≈ ${i.kcal} kcal`.replace(/\s+/g, " "))
+    .join("\n");
 
-  const est = await openaiJSON(userText);
-  if (!est) return "Tive um problema para calcular agora. Pode escrever de outro jeito? 😊";
+  const total = analise.total_kcal || 0;
 
-  day.items.push({ text: userText, kcal: est.kcal, detalhe: est.detalhe });
-  day.total += est.kcal;
+  let msg =
+`Certo${nomeUsuario ? `, ${nomeUsuario}` : ""}! Aqui vai uma estimativa rápida:
 
-  const restante = Math.max(0, user.goal - day.total);
-  const msg =
-    `✅ Anotei: ~${est.kcal} kcal\n` +
-    (est.detalhe ? `🔎 ${est.detalhe}\n` : "") +
-    `📅 ${key} | Parcial do dia: **${day.total} kcal** / meta **${user.goal} kcal**\n` +
-    (restante > 0
-      ? `🎯 Faltam ~${restante} kcal para a meta.\n` +
-        `👉 Dica: priorize **proteína magra** (frango, ovos, iogurte), **fibra** (salada/legumes) e **água** para saciedade.`
-      : `🎉 Você atingiu a meta do dia. Mantenha hidratação e foque em alimentos leves no restante do dia.`);
+${itensTxt || "• Não consegui identificar itens com segurança 😅"}
+
+⚖️ *Total estimado*: *${total} kcal*
+💡 ${analise.dica_curta || "Equilibre carboidratos com proteínas para saciedade."}
+
+Se quiser, posso somar o *dia todo*. Me conte também o que rolou nas outras refeições.`;
+
   return msg;
 }
 
-function handleTotal(wa) {
-  const { user, day, key } = getUser(wa);
-  const restante = Math.max(0, user.goal - day.total);
-  const lista =
-    day.items.length === 0
-      ? "—"
-      : day.items.map((it, i) => `${i + 1}. ${it.text} (~${it.kcal} kcal)`).join("\n");
-  return (
-    `📊 Resumo ${key}\n` +
-    `Meta: ${user.goal} kcal\n` +
-    `Consumido: ${day.total} kcal\n` +
-    `Faltam: ${restante} kcal\n` +
-    `Itens:\n${lista}`
-  );
-}
+// --------- WhatsApp (360dialog) ---------
+async function sendWhatsAppText(toWaId, bodyText) {
+  if (!D360_API_KEY) throw new Error("D360_API_KEY ausente");
 
-function handleReset(wa) {
-  const { user } = getUser(wa);
-  user.days[todayKey()] = { total: 0, items: [] };
-  return "🔄 Zerei o total de hoje. Pode me enviar sua próxima refeição! 😊";
-}
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to: toWaId,
+    type: "text",
+    text: { preview_url: false, body: bodyText },
+  };
 
-function handleSetGoal(wa, goal) {
-  const { user } = getUser(wa);
-  user.goal = Math.min(Math.max(goal, 800), 5000); // sanidade
-  return `🎯 Nova meta diária definida: **${user.goal} kcal**.`;
-}
+  const r = await fetch(D360_SEND, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "D360-API-KEY": D360_API_KEY,
+    },
+    body: JSON.stringify(payload),
+  });
 
-// ---------- Routes ----------
-app.get("/", (_, res) => res.send("✅ Kali Nutro IA Online 🥦"));
-
-app.post("/webhook", async (req, res) => {
-  log("blue", "🟦 Webhook recebido");
-  const msg = extractMessage(req.body);
-  if (!msg) {
-    log("yellow", "🟨 Payload sem texto identificável.");
-    return res.sendStatus(200);
+  if (!r.ok) {
+    const err = await r.text().catch(() => "");
+    throw new Error(`Envio 360 falhou ${r.status}: ${err}`);
   }
 
-  const intent = parseCommand(msg.text);
-  let reply;
+  const data = await r.json().catch(() => ({}));
+  return data;
+}
 
-  try {
-    if (intent.type === "total") reply = handleTotal(msg.from);
-    else if (intent.type === "reset") reply = handleReset(msg.from);
-    else if (intent.type === "set_goal") reply = handleSetGoal(msg.from, intent.goal);
-    else reply = await handleMeal(msg.from, msg.text);
-  } catch (e) {
-    log("red", "❌ Erro no fluxo", e);
-    reply = "Deu um errinho aqui. Pode repetir a mensagem? 🙏";
-  }
-
-  await sendMessage(msg.from, reply);
-  res.sendStatus(200);
+// --------- Webhook ---------
+app.get("/", (_req, res) => {
+  log.blue("🔔 Endpoint 360dialog: " + D360_SEND);
+  log.green("🚀 Kali Nutro IA rodando na porta " + PORT);
+  res.send("OK");
 });
 
-// ---------- Start ----------
+app.post("/webhook", async (req, res) => {
+  log.blue("🟦 Webhook recebido");
+
+  try {
+    const body = req.body;
+
+    // Estrutura típica da 360dialog / Meta Webhook
+    const change = body?.entry?.[0]?.changes?.[0];
+    const value = change?.value;
+
+    // Ignore eventos de status (entregue/lido/failed)
+    const statuses = value?.statuses;
+    if (Array.isArray(statuses) && statuses.length > 0) {
+      return res.sendStatus(200);
+    }
+
+    const msg = value?.messages?.[0];
+    const texto = msg?.text?.body?.trim();
+    const from = msg?.from; // wa_id do remetente
+    const profileName = value?.contacts?.[0]?.profile?.name;
+
+    if (!texto || !from) {
+      log.yellow("Webhook sem texto ou remetente identificável.");
+      return res.sendStatus(200);
+    }
+
+    // Chama IA para entender/estimar
+    let analise;
+    try {
+      analise = await callOpenAI(texto);
+    } catch (e) {
+      log.red("Falha OpenAI: " + e.message);
+      analise = fallbackEstimativa(texto);
+    }
+
+    const resposta = montarResposta(profileName, analise);
+
+    try {
+      await sendWhatsAppText(from, resposta);
+    } catch (e) {
+      log.red("Falha ao enviar WhatsApp: " + e.message);
+    }
+
+    res.sendStatus(200);
+  } catch (e) {
+    log.red("Erro no webhook: " + e.message);
+    res.sendStatus(200);
+  }
+});
+
+// --------- Start ---------
 app.listen(PORT, () => {
-  log("green", `🚀 Kali Nutro IA rodando na porta ${PORT}`);
-  log("blue", `🔔 Endpoint 360dialog: ${ENDPOINT_360}`);
-  if (!D360_API_KEY) log("yellow", "⚠️ Falta D360_API_KEY no Railway!");
-  if (!OPENAI_API_KEY) log("yellow", "⚠️ Falta OPENAI_API_KEY no Railway!");
+  log.green(`🚀 Kali Nutro IA rodando na porta ${PORT}`);
+  log.blue(`🔔 Endpoint 360dialog: ${D360_SEND}`);
 });
