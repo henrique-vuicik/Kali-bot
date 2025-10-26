@@ -1,9 +1,8 @@
-// index.js — Kali Nutro IA (360dialog + Cloud fallback + Visão com fallback)
-// Node 18+ (usa fetch nativo). Se estiver em Node <18, instale undici e descomente a linha abaixo:
-// import 'undici/polyfill';
+// index.js — Kali Nutro IA (CommonJS, Node 18+)
+// Node 18 já tem global fetch.
 
-import express from "express";
-import bodyParser from "body-parser";
+const express = require("express");
+const bodyParser = require("body-parser");
 
 const app = express();
 app.use(bodyParser.json({ limit: "10mb" }));
@@ -16,7 +15,7 @@ const D360_API_KEY = process.env.D360_API_KEY;
 const D360_BASE = "https://waba-v2.360dialog.io";
 
 // Cloud API (fallback)
-const CLOUD_TOKEN = process.env.WHATSAPP_CLOUD_TOKEN; // long-lived User access token
+const CLOUD_TOKEN = process.env.WHATSAPP_CLOUD_TOKEN; // long-lived token
 const CLOUD_PHONE_ID = process.env.WHATSAPP_CLOUD_PHONE_ID; // phone number id
 const GRAPH_BASE = "https://graph.facebook.com/v21.0";
 
@@ -32,7 +31,6 @@ function log(...args) {
 function j(x) {
   try { return JSON.stringify(x); } catch { return String(x); }
 }
-
 function isQuotaError(err) {
   const msg = (err?.error?.message || err?.message || "").toLowerCase();
   const code = err?.error?.code || err?.code;
@@ -97,7 +95,6 @@ async function sendWhatsAppText(to, body) {
 }
 
 // ---------------------- WHATSAPP MEDIA DOWNLOAD ----------------------
-// Tenta baixar a mídia via 360; se vier Not found, tenta Cloud/Graph
 async function downloadImageBuffer(mediaId) {
   // 1) 360
   try {
@@ -153,7 +150,6 @@ Responda exatamente neste formato:
 Total: X kcal
 Observação: (algo útil e breve).`;
 
-  // chamada crua à API /responses
   async function callModel(model) {
     const url = "https://api.openai.com/v1/responses";
     const payload = {
@@ -181,16 +177,14 @@ Observação: (algo útil e breve).`;
       throw e;
     }
     const data = await r.json();
-    // saída “unificada”
     const text =
       data.output_text ||
-      data.content?.map?.(c => c?.text)?.join("\n") ||
-      data.choices?.[0]?.message?.content ||
+      (Array.isArray(data.content) ? data.content.map(c => c?.text).join("\n") : "") ||
+      (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) ||
       JSON.stringify(data);
     return (text || "").trim();
   }
 
-  // tenta principal → fallback
   for (const model of [VISION_MODEL, VISION_MODEL_FALLBACK]) {
     try {
       log("🧠 Usando modelo:", model);
@@ -207,7 +201,6 @@ Observação: (algo útil e breve).`;
 
 // ---------------------- BUSINESS LOGIC ----------------------
 async function handleTextMessage(from, name, body) {
-  // Parse simples de exemplos (pode manter seu parser atual)
   const lower = (body || "").toLowerCase().trim();
   if (!lower) {
     return sendWhatsAppText(
@@ -215,9 +208,7 @@ async function handleTextMessage(from, name, body) {
       "Oi! Me diga o que você comeu (ex.: “2 fatias de pão, 1 ovo e café”) ou envie uma *foto do prato* que eu estimo as calorias. 🍽️📸"
     );
   }
-
   // Aqui você pode plugar seu estimador por texto existente.
-  // Como fallback simples:
   return sendWhatsAppText(
     from,
     "Beleza! Se quiser, *mande uma foto* que eu estimo as calorias visualmente também. 😉"
@@ -225,10 +216,9 @@ async function handleTextMessage(from, name, body) {
 }
 
 async function handleImageMessage(from, name, imageObj) {
-  // Confirmação imediata de recebimento
+  // Confirmação rápida
   await sendWhatsAppText(from, "Recebi sua foto! Vou estimar as calorias por imagem. 🧠📸");
 
-  // Baixa media (360 → Cloud)
   const mediaId = imageObj?.id;
   if (!mediaId) {
     return sendWhatsAppText(from, "Não consegui identificar a mídia recebida. Pode reenviar? 🙏");
@@ -236,6 +226,7 @@ async function handleImageMessage(from, name, imageObj) {
 
   let imageBuf;
   try {
+    log("🖼️  msg.image bruto:", j(imageObj));
     imageBuf = await downloadImageBuffer(mediaId);
     log("📥 Imagem obtida. Bytes:", imageBuf.length);
   } catch (e) {
@@ -243,7 +234,6 @@ async function handleImageMessage(from, name, imageObj) {
     return sendWhatsAppText(from, "Tive um problema ao baixar a foto. Pode tentar novamente? 🙏");
   }
 
-  // IA de visão
   try {
     const result = await askVision(imageBuf);
     await sendWhatsAppText(from, result);
@@ -257,15 +247,13 @@ async function handleImageMessage(from, name, imageObj) {
 }
 
 // ---------------------- WEBHOOK ----------------------
-// 360 e Cloud entregam estruturas similares no “messages”
 app.post("/webhook", async (req, res) => {
   log("🟦 Webhook recebido");
   try {
     const body = req.body;
-    // Normaliza entrada (360/Cloud)
     const entry = body?.entry?.[0];
     const changes = entry?.changes?.[0];
-    const value = changes?.value || body; // alguns ambientes mandam direto
+    const value = changes?.value || body;
     const messages = value?.messages || [];
 
     if (!messages.length) {
@@ -274,13 +262,12 @@ app.post("/webhook", async (req, res) => {
     }
 
     const msg = messages[0];
-    const from = msg.from; // telefone do usuário
+    const from = msg.from;
     const name = value?.contacts?.[0]?.profile?.name || "Amigo(a)";
 
     if (msg.type === "text") {
       await handleTextMessage(from, name, msg.text?.body);
     } else if (msg.type === "image") {
-      log("🖼️ msg.image bruto:", j(msg.image));
       await handleImageMessage(from, name, msg.image);
     } else {
       await sendWhatsAppText(
@@ -292,11 +279,11 @@ app.post("/webhook", async (req, res) => {
     res.sendStatus(200);
   } catch (e) {
     log("🔥 Erro no webhook:", e.message || e);
-    res.sendStatus(200); // evita reentrega
+    res.sendStatus(200);
   }
 });
 
-// Ping simples
+// Ping
 app.get("/", (_, res) => res.send("Kali Nutro IA online 🚀"));
 
 app.listen(PORT, () => {
