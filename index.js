@@ -1,221 +1,305 @@
-// Kali Nutro IA — 360dialog + Cloud fallback + GPT-4o Vision
-// Node 18+
+// index.js — Kali Nutro IA (360dialog + Cloud fallback + Visão com fallback)
+// Node 18+ (usa fetch nativo). Se estiver em Node <18, instale undici e descomente a linha abaixo:
+// import 'undici/polyfill';
 
-const express = require('express');
+import express from "express";
+import bodyParser from "body-parser";
+
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(bodyParser.json({ limit: "10mb" }));
 
-// ===== ENV =====
+// ---------------------- CONFIG ----------------------
 const PORT = process.env.PORT || 8080;
-const BASE_URL = process.env.WABA_BASE_URL || 'https://waba-v2.360dialog.io';
+
+// 360dialog
 const D360_API_KEY = process.env.D360_API_KEY;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'kali-verify';
-const WHATSAPP_CLOUD_TOKEN = process.env.WHATSAPP_CLOUD_TOKEN || '';
-const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v21.0';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const VISION_MODEL = process.env.VISION_MODEL || 'gpt-4o';
+const D360_BASE = "https://waba-v2.360dialog.io";
 
-console.log('\x1b[34m%s\x1b[0m', `🔔 Endpoint primário: ${BASE_URL}/v1/messages`);
-console.log('\x1b[32m%s\x1b[0m', `🟩 🚀 Kali Nutro IA rodando na porta ${PORT}`);
+// Cloud API (fallback)
+const CLOUD_TOKEN = process.env.WHATSAPP_CLOUD_TOKEN; // long-lived User access token
+const CLOUD_PHONE_ID = process.env.WHATSAPP_CLOUD_PHONE_ID; // phone number id
+const GRAPH_BASE = "https://graph.facebook.com/v21.0";
 
-// ===== Helpers =====
-const isDigitsOnly = (s) => typeof s === 'string' && /^[0-9]+$/.test(s);
-function safeJson(txt) { try { return JSON.parse(txt); } catch { return { raw: txt }; } }
+// OpenAI
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const VISION_MODEL = process.env.VISION_MODEL || "gpt-4o";
+const VISION_MODEL_FALLBACK = process.env.VISION_MODEL_FALLBACK || "gpt-4o-mini";
 
-// ===== Envio via 360dialog =====
-async function sendViaLegacy(to, body) {
-  const url = `${BASE_URL}/messages`;
-  const payload = {
-    messaging_product: 'whatsapp',
-    recipient_type: 'individual',
-    to: String(to),
-    type: 'text',
-    text: { body: String(body).slice(0, 4000), preview_url: false }
-  };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'D360-API-KEY': D360_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`legacy_${res.status}:${txt}`);
-  return safeJson(txt);
+// ---------------------- HELPERS ----------------------
+function log(...args) {
+  console.log(...args);
+}
+function j(x) {
+  try { return JSON.stringify(x); } catch { return String(x); }
 }
 
-async function sendViaV1(to, body) {
-  const url = `${BASE_URL}/v1/messages`;
-  const payload = { to, type: 'text', text: { body, preview_url: false } };
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'D360-API-KEY': D360_API_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`v1_${res.status}:${txt}`);
-  return safeJson(txt);
+function isQuotaError(err) {
+  const msg = (err?.error?.message || err?.message || "").toLowerCase();
+  const code = err?.error?.code || err?.code;
+  return code === "insufficient_quota" ||
+         msg.includes("insufficient_quota") ||
+         msg.includes("exceeded your current quota");
 }
 
+// ---------------------- WHATSAPP SENDERS ----------------------
+// 360: envia texto
 async function sendText360(to, body) {
-  try { return await sendViaLegacy(to, body); }
-  catch { return await sendViaV1(to, body); }
-}
-
-// ===== Download mídia =====
-async function downloadMedia360ById(mediaId) {
-  const url = `${BASE_URL}/v1/media/${encodeURIComponent(mediaId)}`;
-  const res = await fetch(url, {
-    method: 'GET',
-    headers: { 'D360-API-KEY': D360_API_KEY, 'Accept': '*/*' }
-  });
-  if (!res.ok) throw new Error('media_not_found');
-  const buffer = Buffer.from(await res.arrayBuffer());
-  const contentType = res.headers.get('content-type') || '';
-  console.log('📥 Baixado via 360:', mediaId);
-  return { buffer, contentType, via: '360' };
-}
-
-async function downloadMediaCloudById(mediaId) {
-  const metaUrl = `https://graph.facebook.com/${GRAPH_API_VERSION}/${mediaId}`;
-  const metaRes = await fetch(metaUrl, {
-    headers: { 'Authorization': `Bearer ${WHATSAPP_CLOUD_TOKEN}` }
-  });
-  const meta = await metaRes.json();
-  if (!meta.url) throw new Error('graph_url_missing');
-  const fileRes = await fetch(meta.url, {
-    headers: { 'Authorization': `Bearer ${WHATSAPP_CLOUD_TOKEN}` }
-  });
-  if (!fileRes.ok) throw new Error('graph_download_failed');
-  const buffer = Buffer.from(await fileRes.arrayBuffer());
-  const contentType = fileRes.headers.get('content-type') || '';
-  console.log('📥 Baixado via Cloud/Graph:', mediaId);
-  return { buffer, contentType, via: 'cloud' };
-}
-
-async function downloadImageSmart(msgImage) {
-  const mediaId = msgImage?.id;
-  const link = msgImage?.link;
-  if (link) {
-    const r = await fetch(link);
-    if (!r.ok) throw new Error('media_link_failed');
-    const buffer = Buffer.from(await r.arrayBuffer());
-    return { buffer, contentType: r.headers.get('content-type') || '', via: 'link' };
-  }
-  if (!mediaId) throw new Error('media_id_missing');
-  if (isDigitsOnly(mediaId)) return await downloadMediaCloudById(mediaId);
-  try { return await downloadMedia360ById(mediaId); }
-  catch { return await downloadMediaCloudById(mediaId); }
-}
-
-// ===== IA de visão (GPT-4o) =====
-async function analyzeImageCalories(buffer) {
-  const b64 = buffer.toString('base64');
-  const prompt = `
-Você é uma nutricionista. Identifique os alimentos visíveis, estime as porções e calcule as calorias aproximadas.
-Responda em JSON:
-{
-  "items": [{"name":"string","portion":"string","kcal":number}],
-  "total": number,
-  "advice": "string"
-}`;
-  const body = {
-    model: VISION_MODEL,
-    messages: [{
-      role: "user",
-      content: [
-        { type: "text", text: prompt },
-        { type: "input_image", image_url: `data:image/jpeg;base64,${b64}` }
-      ]
-    }],
-    temperature: 0.2
-  };
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const url = `${D360_BASE}/v1/messages`;
+  const payload = { to, type: "text", text: { body, preview_url: false } };
+  const r = await fetch(url, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json"
+      "D360-API-KEY": D360_API_KEY,
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify(body)
+    body: JSON.stringify(payload),
   });
-  const txt = await res.text();
-  if (!res.ok) throw new Error(`openai_error: ${txt}`);
-  const data = JSON.parse(txt);
-  const content = data.choices?.[0]?.message?.content || "{}";
-  const jsonMatch = content.match(/\{[\s\S]*\}$/);
-  const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : JSON.parse(content);
-  return parsed;
+  if (!r.ok) {
+    const err = await r.text();
+    throw new Error(`360 messages 400: ${err}`);
+  }
+  return r.json();
 }
 
-// ===== Estimativa por texto =====
-function estimateCaloriesFromText(text) {
-  const db = [
-    { rx: /banana/i, kcal: 90, label: 'Banana (1 un média)' },
-    { rx: /p(ã|a)o (franc[eê]s|frances)/i, kcal: 140, label: 'Pão francês (1 un)' },
-    { rx: /ovo/i, kcal: 70, label: 'Ovo (1 un)' },
-    { rx: /cafe/i, kcal: 2, label: 'Café preto (1 xícara)' },
-    { rx: /arroz/i, kcal: 170, label: 'Arroz cozido (1 xícara)' },
-    { rx: /frango/i, kcal: 200, label: 'Frango grelhado (150g)' },
-    { rx: /salada/i, kcal: 80, label: 'Salada simples (1 prato)' },
-  ];
-  const items = db.filter(i => i.rx.test(text)).map(i => ({ name: i.label, kcal: i.kcal }));
-  const total = items.reduce((s, i) => s + i.kcal, 0);
-  return { items, total };
+// Cloud: envia texto
+async function sendTextCloud(to, body) {
+  if (!CLOUD_TOKEN || !CLOUD_PHONE_ID) throw new Error("Cloud API não configurada");
+  const url = `${GRAPH_BASE}/${CLOUD_PHONE_ID}/messages`;
+  const payload = {
+    messaging_product: "whatsapp",
+    to,
+    type: "text",
+    text: { body, preview_url: false },
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${CLOUD_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    const err = await r.text();
+    throw new Error(`Cloud messages 400: ${err}`);
+  }
+  return r.json();
 }
 
-// ===== Webhook Verify =====
-app.get('/webhook', (req, res) => {
-  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN)
-    return res.status(200).send(req.query['hub.challenge']);
-  return res.sendStatus(403);
-});
-
-// ===== Webhook Principal =====
-app.post('/webhook', async (req, res) => {
-  res.sendStatus(200);
+// Wrapper: tenta 360, cai para Cloud se precisar
+async function sendWhatsAppText(to, body) {
   try {
-    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!msg) return;
-    const from = msg.from;
-    const type = msg.type;
+    await sendText360(to, body);
+  } catch (e) {
+    log("⚠️ Falha ao enviar via 360, tentando Cloud…", e.message || e);
+    await sendTextCloud(to, body);
+  }
+}
 
-    if (type === 'text') {
-      const text = msg.text?.body || '';
-      const { items, total } = estimateCaloriesFromText(text);
-      if (items.length === 0) {
-        await sendText360(from, 'Me conte o que você comeu (ex.: "2 fatias de pão, 1 ovo e café") que eu estimo as calorias. 📋');
-      } else {
-        const linhas = items.map(i => `• ${i.name}: ${i.kcal} kcal`).join('\n');
-        await sendText360(from, `Itens:\n${linhas}\nTotal: ${total} kcal\nDica: envie as outras refeições do dia!`);
-      }
-      return;
+// ---------------------- WHATSAPP MEDIA DOWNLOAD ----------------------
+// Tenta baixar a mídia via 360; se vier Not found, tenta Cloud/Graph
+async function downloadImageBuffer(mediaId) {
+  // 1) 360
+  try {
+    const url = `${D360_BASE}/v1/media/${mediaId}`;
+    const r = await fetch(url, { headers: { "D360-API-KEY": D360_API_KEY } });
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(text);
     }
-
-    if (type === 'image') {
-      console.log('🖼️ msg.image bruto:', JSON.stringify(msg.image || {}, null, 2));
-      const media = await downloadImageSmart(msg.image);
-      try {
-        const result = await analyzeImageCalories(media.buffer);
-        const items = result.items || [];
-        if (!items.length) {
-          await sendText360(from, 'Analisei a foto, mas não consegui identificar com segurança. Pode me descrever o prato? 🙏');
-          return;
-        }
-        const linhas = items.map(i => `• ${i.name}: ${i.portion || ''} ≈ ${i.kcal} kcal`).join('\n');
-        const msgBody = `Itens:\n${linhas}\n\n⚖️ Total estimado: *${Math.round(result.total || 0)} kcal*\nDica: ${result.advice || 'Inclua proteínas magras e fibras!'}`
-        await sendText360(from, msgBody);
-      } catch (e) {
-        console.error('Falha IA imagem:', e.message);
-        await sendText360(from, 'Recebi sua foto! Ainda estou ativando a estimativa por imagem. 😊');
-      }
-      return;
-    }
-
-    await sendText360(from, 'Envie um texto com a refeição ou uma foto do prato. 🍽️');
-
+    const arrayBuffer = await r.arrayBuffer();
+    if (arrayBuffer.byteLength > 0) return Buffer.from(arrayBuffer);
+    throw new Error("empty buffer 360");
   } catch (err) {
-    console.error('Erro no webhook:', err.message);
+    const msg = (err?.message || "").toLowerCase();
+    if (!msg.includes("not found") && !msg.includes("media_not_found"))
+      log("⚠️ Erro 360 media (não NotFound):", err.message || err);
+    else log("ℹ️ 360 media_not_found — tentando Cloud/Graph…");
+  }
+
+  // 2) Cloud/Graph
+  if (!CLOUD_TOKEN) throw new Error("Sem CLOUD_TOKEN para fallback de mídia");
+  const infoUrl = `${GRAPH_BASE}/${mediaId}`;
+  const info = await fetch(infoUrl, {
+    headers: { Authorization: `Bearer ${CLOUD_TOKEN}` },
+  });
+  if (!info.ok) {
+    const t = await info.text();
+    throw new Error(`Graph info fail: ${t}`);
+  }
+  const meta = await info.json(); // {url, mime_type, ...}
+  if (!meta.url) throw new Error("Graph: meta.url ausente");
+
+  const bin = await fetch(meta.url, {
+    headers: { Authorization: `Bearer ${CLOUD_TOKEN}` },
+  });
+  if (!bin.ok) {
+    const t = await bin.text();
+    throw new Error(`Graph download fail: ${t}`);
+  }
+  const ab = await bin.arrayBuffer();
+  return Buffer.from(ab);
+}
+
+// ---------------------- OPENAI (Visão) ----------------------
+async function askVision(bufferOrUrl) {
+  const inputImage = typeof bufferOrUrl === "string"
+    ? { type: "input_image", image_url: bufferOrUrl }
+    : { type: "input_image", image_data: Buffer.from(bufferOrUrl).toString("base64") };
+
+  const prompt = `Você é nutricionista. Pela foto, identifique alimentos, estime porções (g ou ml) e calorias.
+Responda exatamente neste formato:
+• item — porção ≈ kcal
+Total: X kcal
+Observação: (algo útil e breve).`;
+
+  // chamada crua à API /responses
+  async function callModel(model) {
+    const url = "https://api.openai.com/v1/responses";
+    const payload = {
+      model,
+      input: [{
+        role: "user",
+        content: [
+          { type: "input_text", text: prompt },
+          inputImage,
+        ],
+      }],
+    };
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      const e = new Error(`openai_error`);
+      e.error = err?.error || err;
+      throw e;
+    }
+    const data = await r.json();
+    // saída “unificada”
+    const text =
+      data.output_text ||
+      data.content?.map?.(c => c?.text)?.join("\n") ||
+      data.choices?.[0]?.message?.content ||
+      JSON.stringify(data);
+    return (text || "").trim();
+  }
+
+  // tenta principal → fallback
+  for (const model of [VISION_MODEL, VISION_MODEL_FALLBACK]) {
+    try {
+      log("🧠 Usando modelo:", model);
+      const txt = await callModel(model);
+      return `${txt}\n\n🤖 Modelo: ${model}`;
+    } catch (err) {
+      log(`❌ Erro ${model}:`, j(err));
+      if (!isQuotaError(err)) continue;
+      log("⚠️ Quota/limite — tentando fallback…");
+    }
+  }
+  throw new Error("Falha total nos modelos de visão");
+}
+
+// ---------------------- BUSINESS LOGIC ----------------------
+async function handleTextMessage(from, name, body) {
+  // Parse simples de exemplos (pode manter seu parser atual)
+  const lower = (body || "").toLowerCase().trim();
+  if (!lower) {
+    return sendWhatsAppText(
+      from,
+      "Oi! Me diga o que você comeu (ex.: “2 fatias de pão, 1 ovo e café”) ou envie uma *foto do prato* que eu estimo as calorias. 🍽️📸"
+    );
+  }
+
+  // Aqui você pode plugar seu estimador por texto existente.
+  // Como fallback simples:
+  return sendWhatsAppText(
+    from,
+    "Beleza! Se quiser, *mande uma foto* que eu estimo as calorias visualmente também. 😉"
+  );
+}
+
+async function handleImageMessage(from, name, imageObj) {
+  // Confirmação imediata de recebimento
+  await sendWhatsAppText(from, "Recebi sua foto! Vou estimar as calorias por imagem. 🧠📸");
+
+  // Baixa media (360 → Cloud)
+  const mediaId = imageObj?.id;
+  if (!mediaId) {
+    return sendWhatsAppText(from, "Não consegui identificar a mídia recebida. Pode reenviar? 🙏");
+  }
+
+  let imageBuf;
+  try {
+    imageBuf = await downloadImageBuffer(mediaId);
+    log("📥 Imagem obtida. Bytes:", imageBuf.length);
+  } catch (e) {
+    log("🚫 Falha download mídia:", e.message || e);
+    return sendWhatsAppText(from, "Tive um problema ao baixar a foto. Pode tentar novamente? 🙏");
+  }
+
+  // IA de visão
+  try {
+    const result = await askVision(imageBuf);
+    await sendWhatsAppText(from, result);
+  } catch (e) {
+    log("🚫 Falha IA visão:", e.message || e);
+    await sendWhatsAppText(
+      from,
+      "Recebi sua foto, mas tive um problema técnico ao estimar as calorias. Pode tentar de novo mais tarde? 🙏"
+    );
+  }
+}
+
+// ---------------------- WEBHOOK ----------------------
+// 360 e Cloud entregam estruturas similares no “messages”
+app.post("/webhook", async (req, res) => {
+  log("🟦 Webhook recebido");
+  try {
+    const body = req.body;
+    // Normaliza entrada (360/Cloud)
+    const entry = body?.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value || body; // alguns ambientes mandam direto
+    const messages = value?.messages || [];
+
+    if (!messages.length) {
+      res.sendStatus(200);
+      return;
+    }
+
+    const msg = messages[0];
+    const from = msg.from; // telefone do usuário
+    const name = value?.contacts?.[0]?.profile?.name || "Amigo(a)";
+
+    if (msg.type === "text") {
+      await handleTextMessage(from, name, msg.text?.body);
+    } else if (msg.type === "image") {
+      log("🖼️ msg.image bruto:", j(msg.image));
+      await handleImageMessage(from, name, msg.image);
+    } else {
+      await sendWhatsAppText(
+        from,
+        "No momento, entendo *texto* e *foto*. Me envie uma foto do seu prato ou descreva o que comeu. 🙂"
+      );
+    }
+
+    res.sendStatus(200);
+  } catch (e) {
+    log("🔥 Erro no webhook:", e.message || e);
+    res.sendStatus(200); // evita reentrega
   }
 });
 
-// ===== Healthcheck =====
-app.get('/', (_, res) => res.send('✅ Kali Nutro IA (360 + GPT-4o Vision) OK'));
-app.listen(PORT);
+// Ping simples
+app.get("/", (_, res) => res.send("Kali Nutro IA online 🚀"));
+
+app.listen(PORT, () => {
+  log(`🚀 Kali Nutro IA rodando na porta ${PORT}`);
+  log(`🔔 Endpoint primário: ${D360_BASE}/v1/messages`);
+});
