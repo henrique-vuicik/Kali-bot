@@ -1,5 +1,5 @@
-// index.js — Kali Nutro IA (360dialog)
-// Node 18+ (fetch nativo). CommonJS.
+// index.js — Kali Nutro IA (360dialog) — imagem com logs detalhados
+// Node 18 (fetch nativo). CommonJS.
 
 const express = require('express');
 const app = express();
@@ -13,15 +13,12 @@ const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'kali-verify';
 
 console.log('\x1b[34m%s\x1b[0m', `🔔 Endpoint primário: ${BASE_URL}/v1/messages`);
 console.log('\x1b[32m%s\x1b[0m', `🟩 🚀 Kali Nutro IA rodando na porta ${PORT}`);
-if (!D360_API_KEY) {
-  console.warn('\x1b[33m%s\x1b[0m', '⚠️  D360_API_KEY não configurada (Railway > Variables).');
-}
+if (!D360_API_KEY) console.warn('\x1b[33m%s\x1b[0m', '⚠️  D360_API_KEY não configurada.');
 
 // ===== Helpers =====
 function safeJson(txt) { try { return JSON.parse(txt); } catch { return { raw: txt }; } }
 
 async function sendViaLegacy(to, body) {
-  // Algumas contas 360 exigem 'messaging_product' no endpoint legacy (/messages)
   const url = `${BASE_URL}/messages`;
   const payload = {
     messaging_product: 'whatsapp',
@@ -44,7 +41,6 @@ async function sendViaLegacy(to, body) {
 }
 
 async function sendViaV1(to, body) {
-  // Outras contas 360 aceitam melhor o v1/messages SEM messaging_product
   const url = `${BASE_URL}/v1/messages`;
   const payload = {
     to: String(to),
@@ -64,20 +60,21 @@ async function sendViaV1(to, body) {
   return safeJson(text);
 }
 
-// Envio com fallback: tenta legacy primeiro; se falhar, tenta v1 (ou o inverso — sinta-se livre p/ inverter)
+// Envio com fallback
 async function sendText360(to, body) {
-  // 1) tenta legacy com messaging_product
-  try { return await sendViaLegacy(to, body); } catch (e1) {
+  try { return await sendViaLegacy(to, body); }
+  catch (e1) {
     console.warn('⚠️  Falha legacy, tentando v1/messages…', e1.message || e1);
-    // 2) tenta v1 sem messaging_product
-    try { return await sendViaV1(to, body); } catch (e2) {
+    try { return await sendViaV1(to, body); }
+    catch (e2) {
       console.error('\x1b[31m%s\x1b[0m', 'Falha ao enviar WhatsApp:', (e2.message || e2));
       throw e2;
     }
   }
 }
 
-async function downloadMedia360(mediaId) {
+// Download mídia via 360
+async function downloadMedia360ById(mediaId) {
   const url = `${BASE_URL}/v1/media/${encodeURIComponent(mediaId)}`;
   const res = await fetch(url, {
     method: 'GET',
@@ -93,7 +90,20 @@ async function downloadMedia360(mediaId) {
   return { buffer, contentType };
 }
 
-// Nutrologia simples (placeholder)
+// Download direto se vier link (padrão Cloud API)
+async function downloadMediaByUrlDirect(link) {
+  const res = await fetch(link, { method: 'GET' });
+  if (!res.ok) {
+    const err = await res.text().catch(() => '');
+    console.error('\x1b[31m%s\x1b[0m', 'Falha ao baixar URL direta:', err || res.statusText);
+    throw new Error('media_link_failed');
+  }
+  const buffer = Buffer.from(await res.arrayBuffer());
+  const contentType = res.headers.get('content-type') || '';
+  return { buffer, contentType };
+}
+
+// Calorias (simples)
 function estimateCaloriesFromText(text) {
   const db = [
     { rx: /banana/i, kcal: 90, label: 'Banana (1 un média)' },
@@ -123,7 +133,7 @@ app.get('/webhook', (req, res) => {
 
 // ===== Webhook Receiver (POST) =====
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // responde rápido
+  res.sendStatus(200);
   try {
     console.log('\x1b[34m%s\x1b[0m', '🟦 Webhook recebido');
 
@@ -142,7 +152,6 @@ app.post('/webhook', async (req, res) => {
     if (type === 'text') {
       const text = msg.text?.body || '';
       const { items, total } = estimateCaloriesFromText(text);
-
       let reply;
       if (items.length === 0) {
         reply = 'Me conte o que você comeu (ex.: "2 fatias de pão, 1 ovo e café") que eu estimo as calorias. 📋';
@@ -155,29 +164,42 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (type === 'image') {
-      // 360 costuma enviar em messages[0].image.id
-      const mediaId = msg.image?.id || msg?.image?.media_id || msg?.image?.mediaId;
-      if (!mediaId) {
-        await sendText360(from, 'Não consegui ler a imagem. Pode reenviar? 🙏');
+      // LOG COMPLETO do nó de imagem pra inspecionar os campos disponíveis
+      console.log('🖼️  msg.image bruto:', JSON.stringify(msg.image || {}, null, 2));
+
+      // 1) Campo típico na 360
+      const mediaId360 = msg.image?.id;
+
+      // 2) Campo típico do Cloud (por vezes 360 repassa como link)
+      const mediaLink = msg.image?.link;
+
+      if (!mediaId360 && !mediaLink) {
+        console.warn('⚠️  Nenhum mediaId/link encontrado em msg.image');
+        await sendText360(from, 'Não consegui ler a imagem. Pode reenviar uma foto nova? 🙏');
         return;
       }
 
       try {
-        const media = await downloadMedia360(mediaId);
-        // Aqui entraria a IA de visão (OpenAI Vision) usando 'media.buffer'
+        let media;
+        if (mediaId360) {
+          media = await downloadMedia360ById(mediaId360);
+        } else if (mediaLink) {
+          media = await downloadMediaByUrlDirect(mediaLink);
+        }
+
+        // Aqui entraria a IA de visão (OpenAI Vision) usando media.buffer
         await sendText360(from, 'Recebi sua foto! Em breve vou estimar calorias por imagem. 🧠📸');
       } catch (e) {
-        console.error('\x1b[31m%s\x1b[0m', 'Falha fluxo imagem:', e.message || e);
-        await sendText360(from, 'Tive um problema ao baixar/analisar a foto. Pode tentar novamente? 🙏');
+        console.error('\x1b[31m%s\x1b[0m', 'Falha fluxo imagem:', e?.message || e);
+        await sendText360(from, 'Tive um problema ao baixar/analisar a foto. Pode enviar outra tirada agora? 🙏');
       }
       return;
     }
 
-    await sendText360(from, 'Envie texto com a refeição ou uma foto do prato. 🍽️');
+    await sendText360(from, 'Envie um texto com a refeição ou uma foto do prato. 🍽️');
 
   } catch (err) {
     console.error('\x1b[31m%s\x1b[0m', 'Erro no webhook:', err?.message || err);
-    // tenta avisar o usuário se ainda temos 'from' no escopo (seguro ignorar em caso de falha)
   }
 });
 
