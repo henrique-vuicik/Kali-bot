@@ -1,23 +1,32 @@
-// index.js — Kali Nutro IA (360dialog) — imagem com logs detalhados
+// index.js — Kali Nutro IA (360dialog + fallback Cloud para mídia)
 // Node 18 (fetch nativo). CommonJS.
 
 const express = require('express');
 const app = express();
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '10mb' }));
 
 // ===== ENV =====
 const PORT = process.env.PORT || 8080;
-const BASE_URL = process.env.WABA_BASE_URL || 'https://waba-v2.360dialog.io';
+
+const BASE_URL = process.env.WABA_BASE_URL || 'https://waba-v2.360dialog.io'; // 360dialog
 const D360_API_KEY = process.env.D360_API_KEY;
+
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'kali-verify';
+
+// Fallback Cloud (apenas para DOWNLOAD de mídia)
+const WHATSAPP_CLOUD_TOKEN = process.env.WHATSAPP_CLOUD_TOKEN || process.env.CLOUD_TOKEN || '';
+const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || 'v21.0';
 
 console.log('\x1b[34m%s\x1b[0m', `🔔 Endpoint primário: ${BASE_URL}/v1/messages`);
 console.log('\x1b[32m%s\x1b[0m', `🟩 🚀 Kali Nutro IA rodando na porta ${PORT}`);
 if (!D360_API_KEY) console.warn('\x1b[33m%s\x1b[0m', '⚠️  D360_API_KEY não configurada.');
+if (!WHATSAPP_CLOUD_TOKEN) console.warn('\x1b[33m%s\x1b[0m', '⚠️  WHATSAPP_CLOUD_TOKEN não configurado (fallback Cloud desabilitado).');
 
-// ===== Helpers =====
+// ===== Utils =====
+const isDigitsOnly = (s) => typeof s === 'string' && /^[0-9]+$/.test(s);
 function safeJson(txt) { try { return JSON.parse(txt); } catch { return { raw: txt }; } }
 
+// ===== Envio WhatsApp via 360 =====
 async function sendViaLegacy(to, body) {
   const url = `${BASE_URL}/messages`;
   const payload = {
@@ -29,7 +38,11 @@ async function sendViaLegacy(to, body) {
   };
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'D360-API-KEY': D360_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    headers: {
+      'D360-API-KEY': D360_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
     body: JSON.stringify(payload)
   });
   const text = await res.text().catch(() => '');
@@ -49,7 +62,11 @@ async function sendViaV1(to, body) {
   };
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'D360-API-KEY': D360_API_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    headers: {
+      'D360-API-KEY': D360_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
     body: JSON.stringify(payload)
   });
   const text = await res.text().catch(() => '');
@@ -60,7 +77,6 @@ async function sendViaV1(to, body) {
   return safeJson(text);
 }
 
-// Envio com fallback
 async function sendText360(to, body) {
   try { return await sendViaLegacy(to, body); }
   catch (e1) {
@@ -73,7 +89,8 @@ async function sendText360(to, body) {
   }
 }
 
-// Download mídia via 360
+// ===== Download de mídia =====
+// 1) 360dialog direto
 async function downloadMedia360ById(mediaId) {
   const url = `${BASE_URL}/v1/media/${encodeURIComponent(mediaId)}`;
   const res = await fetch(url, {
@@ -85,25 +102,81 @@ async function downloadMedia360ById(mediaId) {
     console.error('\x1b[31m%s\x1b[0m', 'Falha 360 ao baixar mídia:', err || res.statusText);
     throw new Error('media_not_found');
   }
+  console.log('📥 Baixado via 360:', mediaId);
   const buffer = Buffer.from(await res.arrayBuffer());
   const contentType = res.headers.get('content-type') || '';
-  return { buffer, contentType };
+  return { buffer, contentType, via: '360' };
 }
 
-// Download direto se vier link (padrão Cloud API)
-async function downloadMediaByUrlDirect(link) {
-  const res = await fetch(link, { method: 'GET' });
-  if (!res.ok) {
-    const err = await res.text().catch(() => '');
-    console.error('\x1b[31m%s\x1b[0m', 'Falha ao baixar URL direta:', err || res.statusText);
-    throw new Error('media_link_failed');
+// 2) Cloud API (Graph) – quando id é numérico OU fallback do 360
+async function downloadMediaCloudById(mediaId) {
+  if (!WHATSAPP_CLOUD_TOKEN) throw new Error('cloud_token_missing');
+  // Passo A: obter URL do media
+  const metaUrl = `https://graph.facebook.com/${GRAPH_API_VERSION}/${encodeURIComponent(mediaId)}`;
+  const metaRes = await fetch(metaUrl, {
+    method: 'GET',
+    headers: { 'Authorization': `Bearer ${WHATSAPP_CLOUD_TOKEN}` }
+  });
+  const metaTxt = await metaRes.text().catch(() => '');
+  if (!metaRes.ok) {
+    console.error('\x1b[31m%s\x1b[0m', 'Falha Graph meta mídia:', metaTxt || metaRes.statusText);
+    throw new Error('graph_meta_failed');
   }
-  const buffer = Buffer.from(await res.arrayBuffer());
-  const contentType = res.headers.get('content-type') || '';
-  return { buffer, contentType };
+  const meta = safeJson(metaTxt);
+  const url = meta.url;
+  if (!url) throw new Error('graph_url_missing');
+
+  // Passo B: baixar binário da mídia
+  const fileRes = await fetch(url, {
+    method: 'GET',
+    headers: { 'Authorization': `Bearer ${WHATSAPP_CLOUD_TOKEN}` }
+  });
+  if (!fileRes.ok) {
+    const err = await fileRes.text().catch(() => '');
+    console.error('\x1b[31m%s\x1b[0m', 'Falha Graph download:', err || fileRes.statusText);
+    throw new Error('graph_download_failed');
+  }
+  console.log('📥 Baixado via Cloud/Graph:', mediaId);
+  const buffer = Buffer.from(await fileRes.arrayBuffer());
+  const contentType = fileRes.headers.get('content-type') || '';
+  return { buffer, contentType, via: 'cloud' };
 }
 
-// Calorias (simples)
+// Heurística unificada
+async function downloadImageSmart(msgImage) {
+  const mediaId = msgImage?.id;
+  const link = msgImage?.link;
+
+  // 0) Se o WhatsApp entregar link direto (raro no 360), tenta direto
+  if (link) {
+    const r = await fetch(link, { method: 'GET' });
+    if (!r.ok) throw new Error('media_link_failed');
+    const buffer = Buffer.from(await r.arrayBuffer());
+    const contentType = r.headers.get('content-type') || '';
+    console.log('📥 Baixado via link direto (Cloud-style).');
+    return { buffer, contentType, via: 'link' };
+  }
+
+  if (!mediaId) throw new Error('media_id_missing');
+
+  // 1) Se id é numérico, prioriza Cloud (formato típico do Graph)
+  if (isDigitsOnly(mediaId)) {
+    try { return await downloadMediaCloudById(mediaId); }
+    catch (e) {
+      console.warn('⚠️  Falha Cloud, tentando 360 como fallback…', e?.message || e);
+      return await downloadMedia360ById(mediaId);
+    }
+  }
+
+  // 2) Caso contrário, tenta 360 primeiro e depois Cloud
+  try { return await downloadMedia360ById(mediaId); }
+  catch (e) {
+    console.warn('⚠️  Falha 360, tentando Cloud como fallback…', e?.message || e);
+    return await downloadMediaCloudById(mediaId);
+  }
+}
+
+// ===== Calorias (por texto — simples demo) =====
 function estimateCaloriesFromText(text) {
   const db = [
     { rx: /banana/i, kcal: 90, label: 'Banana (1 un média)' },
@@ -141,7 +214,7 @@ app.post('/webhook', async (req, res) => {
     const change = entry?.changes?.[0];
     const value  = change?.value;
 
-    if (value?.statuses) return; // ignore status callbacks
+    if (value?.statuses) return; // ignora callbacks de status
 
     const msg = value?.messages?.[0];
     if (!msg) return;
@@ -164,36 +237,18 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (type === 'image') {
-      // LOG COMPLETO do nó de imagem pra inspecionar os campos disponíveis
       console.log('🖼️  msg.image bruto:', JSON.stringify(msg.image || {}, null, 2));
 
-      // 1) Campo típico na 360
-      const mediaId360 = msg.image?.id;
-
-      // 2) Campo típico do Cloud (por vezes 360 repassa como link)
-      const mediaLink = msg.image?.link;
-
-      if (!mediaId360 && !mediaLink) {
-        console.warn('⚠️  Nenhum mediaId/link encontrado em msg.image');
-        await sendText360(from, 'Não consegui ler a imagem. Pode reenviar uma foto nova? 🙏');
-        return;
-      }
-
       try {
-        let media;
-        if (mediaId360) {
-          media = await downloadMedia360ById(mediaId360);
-        } else if (mediaLink) {
-          media = await downloadMediaByUrlDirect(mediaLink);
-        }
-
-        // Aqui entraria a IA de visão (OpenAI Vision) usando media.buffer
+        const media = await downloadImageSmart(msg.image);
+        // Aqui você pode chamar a IA de visão com media.buffer
         await sendText360(from, 'Recebi sua foto! Em breve vou estimar calorias por imagem. 🧠📸');
+        return;
       } catch (e) {
         console.error('\x1b[31m%s\x1b[0m', 'Falha fluxo imagem:', e?.message || e);
         await sendText360(from, 'Tive um problema ao baixar/analisar a foto. Pode enviar outra tirada agora? 🙏');
+        return;
       }
-      return;
     }
 
     await sendText360(from, 'Envie um texto com a refeição ou uma foto do prato. 🍽️');
@@ -203,6 +258,6 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Health
-app.get('/', (_, res) => res.send('Kali Nutro IA (360dialog) OK'));
+// Healthcheck
+app.get('/', (_, res) => res.send('Kali Nutro IA (360 + Cloud fallback) OK'));
 app.listen(PORT);
