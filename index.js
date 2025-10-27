@@ -1,148 +1,176 @@
-// index.js (CommonJS)
-const express = require('express');
-const crypto = require('crypto');
-const axios = require('axios');
+// index.js — Kali-bot (somente 360dialog, estável)
+// CommonJS para evitar erro de ESM ("Cannot use import...")
+
+const express = require("express");
+const bodyParser = require("body-parser");
+const axios = require("axios");
 
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(bodyParser.json({ limit: "10mb" }));
 
 // ===== ENV =====
 const PORT = process.env.PORT || 8080;
+const D360_API_KEY = process.env.D360_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // opcional p/ visão
+const TEST_TO = process.env.TEST_TO;
 
-// 360dialog
-const D360_TOKEN = process.env.D360_TOKEN || '';
-const D360_URL = process.env.D360_API_URL || 'https://waba-v2.360dialog.io/v1/messages';
+const D360_URL_MESSAGES = "https://waba-v2.360dialog.io/v1/messages";
+const D360_URL_MEDIA = "https://waba-v2.360dialog.io/v1/media";
 
-// Cloud API
-const CLOUD_TOKEN = process.env.WHATSAPP_CLOUD_TOKEN || '';
-const CLOUD_PHONE_ID = process.env.WHATSAPP_CLOUD_PHONE_ID || '';
-const CLOUD_BASE = process.env.WABA_CLOUD_URL || 'https://graph.facebook.com/v21.0';
+// ===== Helpers 360 =====
+async function sendText360(to, body) {
+  if (!D360_API_KEY) throw new Error("D360_API_KEY ausente");
+  const payload = {
+    to,                 // MSISDN: 55DDDNNNNNNN
+    type: "text",
+    text: { body, preview_url: false }
+  };
+  const headers = {
+    "Content-Type": "application/json",
+    "D360-API-KEY": D360_API_KEY
+  };
+  return axios.post(D360_URL_MESSAGES, payload, { headers });
+}
 
-// ===== HELPERS =====
-async function send360Text(to, body) {
+async function sendImage360(to, link, caption) {
   const payload = {
     to,
-    type: 'text',
-    text: { body, preview_url: false },
+    type: "image",
+    image: { link, caption: caption || "" }
   };
-  try {
-    const { data } = await axios.post(D360_URL, payload, {
-      headers: {
-        'D360-API-KEY': D360_TOKEN,
-        'Content-Type': 'application/json',
-      },
-      timeout: 15000,
-    });
-    return { ok: true, data, via: '360' };
-  } catch (err) {
-    const msg = (err.response && err.response.data) ? err.response.data : String(err);
-    return { ok: false, error: msg, via: '360' };
-  }
+  const headers = {
+    "Content-Type": "application/json",
+    "D360-API-KEY": D360_API_KEY
+  };
+  return axios.post(D360_URL_MESSAGES, payload, { headers });
 }
 
-async function sendCloudText(to, body) {
-  if (!CLOUD_TOKEN || !CLOUD_PHONE_ID) {
-    return { ok: false, error: 'Cloud API não configurada', via: 'cloud' };
+async function downloadMedia360(mediaId) {
+  const headers = { "D360-API-KEY": D360_API_KEY };
+  // 360 retorna o binário diretamente
+  const res = await axios.get(`${D360_URL_MEDIA}/${mediaId}`, {
+    headers,
+    responseType: "arraybuffer",
+    validateStatus: () => true
+  });
+  if (res.status !== 200) {
+    throw new Error(`media_not_found (${res.status})`);
   }
-  const url = `${CLOUD_BASE}/${CLOUD_PHONE_ID}/messages`;
+  return Buffer.from(res.data);
+}
+
+// ===== OpenAI visão (opcional) =====
+async function estimateCaloriesFromImage(bufferJpeg) {
+  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY ausente");
+  const b64 = bufferJpeg.toString("base64");
+  const dataUrl = `data:image/jpeg;base64,${b64}`;
+
+  // Uso do chat.completions com input de imagem (modelo leve p/ custo)
+  const prompt = `
+Você é um nutricionista. A partir da imagem, estime:
+- O que parece ser o alimento.
+- Quantidade aproximada (em ml ou g).
+- Calorias aproximadas (kcal).
+- 1 dica curta.
+
+Responda em 3 linhas no formato:
+Itens: ...
+Total: ... kcal
+Dica: ...
+`.trim();
+
   const payload = {
-    messaging_product: 'whatsapp',
-    to,
-    type: 'text',
-    text: { body, preview_url: false },
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          { type: "image_url", image_url: { url: dataUrl } }
+        ]
+      }
+    ],
+    temperature: 0.2
   };
-  try {
-    const { data } = await axios.post(url, payload, {
-      headers: { Authorization: `Bearer ${CLOUD_TOKEN}` },
-      timeout: 15000,
-    });
-    return { ok: true, data, via: 'cloud' };
-  } catch (err) {
-    const msg = (err.response && err.response.data) ? err.response.data : String(err);
-    return { ok: false, error: msg, via: 'cloud' };
+
+  const r = await axios.post("https://api.openai.com/v1/chat/completions", payload, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    validateStatus: () => true
+  });
+
+  if (r.status !== 200) {
+    const err = r.data?.error?.message || `openai_status_${r.status}`;
+    throw new Error(err);
   }
+
+  const text = r.data?.choices?.[0]?.message?.content?.trim();
+  return text || "Não consegui estimar com segurança.";
 }
 
-async function replyText(to, body) {
-  // tenta 360 primeiro
-  const r360 = await send360Text(to, body);
-  if (r360.ok) return r360;
+// ===== Webhooks =====
 
-  // fallback cloud
-  const rCloud = await sendCloudText(to, body);
-  if (rCloud.ok) return rCloud;
-
-  // retorna ambos erros pra log
-  throw new Error(`Falha 360: ${JSON.stringify(r360.error)} | Falha Cloud: ${JSON.stringify(rCloud.error)}`);
-}
-
-// ===== WEBHOOK VERIFY (Cloud API) =====
-app.get('/webhook', (req, res) => {
-  const verifyToken = process.env.WHATSAPP_CLOUD_VERIFY_TOKEN || 'verify_me';
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-
-  if (mode && token && mode === 'subscribe' && token === verifyToken) {
-    return res.status(200).send(challenge);
-  }
-  return res.sendStatus(403);
+// Saúde
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, provider: "360dialog-only" });
 });
 
-// ===== WEBHOOK RECEIVE (compartilhado p/ 360 e Cloud) =====
-app.post('/webhook', async (req, res) => {
-  console.log('🟦 Webhook recebido');
+// Webhook (coloque esta URL no 360: POST)
+app.post("/webhook", async (req, res) => {
   try {
-    // Normalizar entrada: 360 envia em um formato; Cloud em outro.
-    // Abaixo: tentamos pegar msg simples de texto/imagem com o número do remetente.
-    let from, textBody, imageId;
+    // 360 encaminha o payload padrão do WhatsApp Cloud (entry/changes)
+    const entry = req.body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const msg = value?.messages?.[0];
+    if (!msg) return res.sendStatus(200);
 
-    // 360dialog
-    if (req.body && req.body.messages && Array.isArray(req.body.messages) && req.body.messages[0]) {
-      const m = req.body.messages[0];
-      from = m.from; // já vem E.164
-      if (m.type === 'text' && m.text) textBody = m.text.body;
-      if (m.type === 'image' && m.image) imageId = m.image.id;
-    }
+    const from = msg.from || TEST_TO;
+    if (!from) return res.sendStatus(200);
 
-    // Cloud API
-    if (!from && req.body && req.body.entry) {
-      const changes = req.body.entry?.[0]?.changes?.[0];
-      const msg = changes?.value?.messages?.[0];
-      const contacts = changes?.value?.contacts?.[0];
-      if (msg && contacts) {
-        from = msg.from;
-        if (msg.type === 'text' && msg.text) textBody = msg.text.body;
-        if (msg.type === 'image' && msg.image) imageId = msg.image.id; // para futura análise
-      }
-    }
-
-    if (!from) {
-      console.log('⚠️ Payload sem remetente conhecido.');
+    // Texto
+    if (msg.type === "text" && msg.text?.body) {
+      const body = msg.text.body.trim();
+      // Resposta simples de eco para validar fluxo
+      await sendText360(from, `Recebi: "${body}" ✅`);
       return res.sendStatus(200);
     }
 
-    // Roteamento simples:
-    if (textBody) {
-      await replyText(from, 'Recebi sua mensagem! ✅');
-    } else if (imageId) {
-      // Aqui só responde confirmação (a análise de calorias pode ser ligada depois)
-      await replyText(from, 'Recebi sua foto! Em breve estimarei calorias por imagem. 🤖📸');
-    } else {
-      await replyText(from, 'Mensagem recebida! (tipo não suportado ainda)');
+    // Imagem (estimativa)
+    if (msg.type === "image" && msg.image?.id) {
+      // Avise que recebeu e vai analisar (evita timeout de usuário)
+      await sendText360(from, "Recebi sua foto! Vou estimar as calorias por imagem. 🤖📸");
+
+      try {
+        const bin = await downloadMedia360(msg.image.id);
+        let resposta;
+        try {
+          resposta = await estimateCaloriesFromImage(bin);
+        } catch (e) {
+          // Falha na OpenAI (ex.: insufficient_quota)
+          resposta = "Ainda estou ativando a estimativa por imagem (limite da IA atingido por enquanto). 😊";
+        }
+        await sendText360(from, resposta);
+      } catch (e) {
+        await sendText360(from, "Tive um problema ao baixar a imagem pelo 360. Pode tentar reenviar? 🙏");
+      }
+      return res.sendStatus(200);
     }
 
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error('🔥 Erro no webhook:', e?.message || e);
-    return res.sendStatus(200);
+    // Outros tipos
+    await sendText360(from, "Mensagem recebida! (tipo ainda não suportado) 🙌");
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("🔥 Erro no webhook:", err?.response?.data || err.message || err);
+    // Nunca devolva !=200 para o provedor
+    res.sendStatus(200);
   }
 });
 
-// ===== HEALTHCHECK =====
-app.get('/', (_req, res) => res.send('Kali Nutro IA OK'));
-
+// Start
 app.listen(PORT, () => {
-  console.log(`🟩 🚀 Kali Nutro IA rodando na porta ${PORT}`);
-  console.log(`🔔 Endpoint primário 360: ${D360_URL}`);
+  console.log(`🚀 Kali Nutro IA rodando na porta ${PORT}`);
+  console.log(`🔔 Endpoint 360: ${D360_URL_MESSAGES}`);
 });
