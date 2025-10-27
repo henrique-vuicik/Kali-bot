@@ -1,67 +1,61 @@
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
-require("dotenv").config();
+
+// ➜ Variáveis vindas do Railway (NÃO usar dotenv)
+const PORT = process.env.PORT || 8080;
+const D360_API_KEY = process.env.D360_API_KEY;
+const TEST_TO = process.env.TEST_TO || "554291251751";
+
+// --- util para enviar texto via 360dialog ---
+async function send360(to, body) {
+  return axios.post(
+    "https://waba-v2.360dialog.io/v1/messages",
+    {
+      recipient_type: "individual",
+      to,
+      type: "text",
+      text: { body, preview_url: false }
+    },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "D360-API-KEY": D360_API_KEY
+      },
+      timeout: 15000
+    }
+  );
+}
 
 const app = express();
 app.use(bodyParser.json());
 
-const PORT = process.env.PORT || 8080;
-const D360_API_KEY = process.env.D360_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const WHATSAPP_PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
+// Healthcheck
+app.get("/", (_, res) => res.send("🟩 Kali (estável – 360) online"));
 
-// Função para enviar mensagens via 360dialog
-async function enviarMensagem(to, texto) {
-  try {
-    await axios.post(
-      "https://waba-v2.360dialog.io/v1/messages",
-      {
-        to,
-        type: "text",
-        text: { body: texto },
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "D360-API-KEY": D360_API_KEY,
-        },
-      }
-    );
-  } catch (err) {
-    console.error("🔥 Erro ao enviar mensagem:", err.response?.data || err.message);
-  }
-}
-
-// Webhook principal
+// Webhook
 app.post("/webhook", async (req, res) => {
   console.log("🟦 Webhook recebido");
-
   try {
-    const message = req.body.messages?.[0];
-    if (!message) return res.sendStatus(200);
+    const msg = req.body?.messages?.[0];
+    if (!msg) return res.sendStatus(200);
 
-    const from = message.from;
-    const text = message.text?.body || "";
+    const from = msg.from;
+    const texto = msg.text?.body?.trim() || "";
 
-    if (text.toLowerCase().includes("oi")) {
-      await enviarMensagem(from, "Olá! Aqui é a Kali 😊");
+    if (texto) {
+      await send360(from, "Recebi sua mensagem! 💬");
     } else {
-      await enviarMensagem(from, "Mensagem recebida! 💬");
+      await send360(from, "Oi! Envie um texto para começar. ✨");
     }
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("🔥 Erro no webhook:", err.response?.data || err.message);
-    res.sendStatus(500);
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("🔥 Erro no webhook:", e.response?.data || e.message);
+    return res.sendStatus(200); // evita reentrega em loop
   }
-});
-
-app.get("/", (req, res) => {
-  res.send("🚀 Kali Nutro IA está online!");
 });
 
 app.listen(PORT, () => {
-  console.log(`🟩 🚀 Kali Nutro IA rodando na porta ${PORT}`);
-  console.log("🔔 Endpoint primário: https://waba-v2.360dialog.io/v1/messages");
+  console.log(`🚀 Kali (estável – 360) na porta ${PORT}`);
+  console.log("🔔 Endpoint 360: https://waba-v2.360dialog.io/v1/messages");
 });
