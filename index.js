@@ -1,78 +1,82 @@
 const express = require("express");
 const axios = require("axios");
-const bodyParser = require("body-parser");
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json({ limit: "2mb" }));
 
-// 🔧 Variáveis do ambiente Railway
 const PORT = process.env.PORT || 8080;
 const D360_API_KEY = process.env.D360_API_KEY;
 
-// --- Função para enviar mensagem via 360dialog ---
-async function sendMessage(to, body) {
-  try {
-    const payload = {
-      messaging_product: "whatsapp",
-      recipient_type: "individual",
-      to,
-      type: "text",
-      text: {
-        body,
-        preview_url: false
-      }
-    };
-
-    const res = await axios.post(
-      "https://waba-v2.360dialog.io/v1/messages",
-      payload,
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "D360-API-KEY": D360_API_KEY
-        },
-        timeout: 10000
-      }
-    );
-
-    console.log("✅ Enviado com sucesso:", res.status);
-  } catch (err) {
-    console.error("❌ Falha ao enviar:", err.response?.data || err.message);
-  }
+// --- util de log seguro
+function log(...args) {
+  try { console.log(...args); } catch {}
+}
+function logErr(prefix, err) {
+  const data = err?.response?.data;
+  log(prefix, data ? JSON.stringify(data) : err?.message || err);
 }
 
-// --- Healthcheck ---
-app.get("/", (_, res) => {
-  res.send("🟢 Kali Nutro IA (estável – 360dialog) rodando!");
-});
+// --- envio via 360dialog
+async function sendText(to, body) {
+  const payload = {
+    messaging_product: "whatsapp",
+    recipient_type: "individual",
+    to, // E.164 SEM '+', ex: 5542999998888
+    type: "text",
+    text: { body, preview_url: false }
+  };
 
-// --- Webhook principal ---
+  const url = "https://waba-v2.360dialog.io/v1/messages";
+  const headers = {
+    "Content-Type": "application/json",
+    "D360-API-KEY": D360_API_KEY
+  };
+
+  const res = await axios.post(url, payload, { headers, timeout: 15000 });
+  log("✅ Enviado", res.status, res.data?.messages?.[0]?.id || "");
+  return res.data;
+}
+
+// health
+app.get("/", (_, res) => res.send("🟢 Kali Nutro IA (360) on"));
+
+// webhook principal
 app.post("/webhook", async (req, res) => {
-  console.log("🟦 Webhook recebido");
+  log("🟦 Webhook recebido");
+  // sempre responde 200 rapidamente
+  res.sendStatus(200);
 
   try {
-    const msg = req.body?.messages?.[0];
-    if (!msg) return res.sendStatus(200);
+    // log insumo bruto (cuidado com volume)
+    log("↩️ body:", JSON.stringify(req.body).slice(0, 2000));
 
-    const from = msg.from;
-    const texto = msg.text?.body?.trim();
+    // 360 normalmente entrega em body.messages[0]
+    const msg = req.body?.messages?.[0] || req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
-    if (texto) {
-      console.log(`📩 Mensagem de ${from}: ${texto}`);
-      await sendMessage(from, "Recebi sua mensagem! 👋");
-    } else {
-      await sendMessage(from, "Envie uma mensagem de texto para começar 💬");
+    const from = msg?.from || req.body?.from || req.body?.contacts?.[0]?.wa_id;
+    const text =
+      msg?.text?.body ??
+      req.body?.text?.body ??
+      req.body?.message?.text ??
+      "";
+
+    if (!from) {
+      log("⚠️ Sem campo 'from' no payload");
+      return;
     }
 
-    res.sendStatus(200);
-  } catch (error) {
-    console.error("🔥 Erro no webhook:", error.message);
-    res.sendStatus(200);
+    const reply =
+      text && text.trim()
+        ? `Recebi: "${text.trim()}" 👌`
+        : "Oi! Recebi sua mensagem 👍 (envie texto para começar).";
+
+    await sendText(from, reply);
+  } catch (err) {
+    logErr("🔥 Erro no webhook:", err);
   }
 });
 
-// --- Inicialização ---
 app.listen(PORT, () => {
-  console.log(`🚀 Kali Nutro IA estável rodando na porta ${PORT}`);
-  console.log("🔔 Endpoint 360:", "https://waba-v2.360dialog.io/v1/messages");
+  log(`🚀 Kali Nutro IA estável rodando na porta ${PORT}`);
+  log("🔔 Endpoint 360: https://waba-v2.360dialog.io/v1/messages");
 });
