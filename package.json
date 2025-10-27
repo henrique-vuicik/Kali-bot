@@ -1,12 +1,17 @@
 {
-  "name": "kali-bot",
+  "name": "kali-stable-360",
   "version": "1.0.0",
+  "description": "Versão estável da Kali Nutro IA via 360dialog",
   "main": "index.js",
-  "private": true,
-  "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "axios": "^1.7.7",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "body-parser": "^1.20.2"
   }
 }
