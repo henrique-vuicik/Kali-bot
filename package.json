@@ -1,16 +1,13 @@
 {
-  "name": "kali-bot",
+  "name": "kali-bot-stable",
   "version": "1.0.0",
   "main": "index.js",
-  "license": "MIT",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
   "dependencies": {
-    "axios": "^1.7.2",
+    "axios": "^1.7.7",
     "body-parser": "^1.20.2",
     "express": "^4.19.2"
   }
