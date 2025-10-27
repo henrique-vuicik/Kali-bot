@@ -1,80 +1,72 @@
-// index.js — Kali Nutro IA (estável)
-// Compatível com Node 18+ no Railway
-// Modo CommonJS (sem "type": "module")
-
+// index.js (CommonJS) — Node 18+ tem fetch nativo
 require('dotenv').config();
 const express = require('express');
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 const app = express();
 app.use(express.json());
 
-// Configurações principais
 const PORT = process.env.PORT || 8080;
 const D360_ENDPOINT = 'https://waba-v2.360dialog.io/v1/messages';
 const D360_API_KEY = process.env.D360_API_KEY;
 
-// Função para enviar texto pelo 360dialog
-async function sendText(to, message) {
-  try {
-    const payload = {
-      messaging_product: 'whatsapp',
-      recipient_type: 'individual',
-      to: String(to),
-      type: 'text',
-      text: { body: String(message) }
-    };
+// Envia texto pelo 360dialog
+async function sendText(to, body) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to: String(to), // ex: 55429....
+    type: 'text',
+    text: { body: String(body) }
+  };
 
-    const response = await fetch(D360_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'D360-API-KEY': D360_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    });
+  const resp = await fetch(D360_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'D360-API-KEY': D360_API_KEY,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  });
 
-    const result = await response.text();
-    console.log(`➡️  360 status: ${response.status} body: ${result}`);
-  } catch (err) {
-    console.error('🔥 Erro ao enviar mensagem 360:', err);
-  }
+  const respText = await resp.text();
+  console.log(`➡️  360 status: ${resp.status} body: ${respText}`);
+  return { status: resp.status, body: respText };
 }
 
-// Webhook para receber mensagens do WhatsApp
+// Healthcheck simples
+app.get('/', (_req, res) => res.send('🚀 Kali Nutro IA rodando'));
+
+// Opcional: GET /webhook só para ping/monitor (360 usa POST)
+app.get('/webhook', (_req, res) => res.sendStatus(200));
+
+// Webhook de entrada do 360
 app.post('/webhook', async (req, res) => {
   console.log('🟦 Webhook recebido');
   console.log('↩️ body:', JSON.stringify(req.body));
 
   try {
-    const entry = req.body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-    const message = value?.messages?.[0];
+    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const from = msg?.from;
+    const type = msg?.type;
 
-    if (message && message.type === 'text') {
-      const from = message.from;
-      const userText = message.text.body;
-      console.log(`💬 Mensagem recebida de ${from}: ${userText}`);
-
-      // Resposta automática
+    if (type === 'text') {
+      const userText = msg.text?.body ?? '';
+      console.log(`💬 de ${from}: ${userText}`);
+      // Resposta simples (eco)
       await sendText(from, `Recebi: ${userText} ✅`);
+    } else {
+      console.log('ℹ️ Mensagem não-texto (ignorada neste MVP).');
     }
 
+    // SEMPRE 200 rapidamente para não reentregar
     res.sendStatus(200);
   } catch (err) {
     console.error('🔥 Erro no webhook:', err);
-    res.sendStatus(500);
+    // Ainda responder 200 para evitar reentrega em loop
+    res.sendStatus(200);
   }
 });
 
-// Endpoint de verificação (para debug/teste)
-app.get('/', (req, res) => {
-  res.send('🚀 Kali Nutro IA rodando com sucesso!');
-});
-
-// Inicializa o servidor
 app.listen(PORT, () => {
   console.log(`🚀 Kali Nutro IA estável rodando na porta ${PORT}`);
   console.log(`🔔 Endpoint 360: ${D360_ENDPOINT}`);
