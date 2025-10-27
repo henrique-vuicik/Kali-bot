@@ -30,6 +30,8 @@ app.post("/webhook", async (req, res) => {
           "D360-API-KEY": D360
         },
         body: JSON.stringify({
+          messaging_product: "whatsapp",
+          recipient_type: "individual",
           to,
           type: "text",
           text: { body: `Você disse: ${body}` }
@@ -45,7 +47,7 @@ app.post("/webhook", async (req, res) => {
     console.log("⚠️ Nenhum destinatário válido ou token ausente.");
   }
 
-  res.sendStatus(200); // responde para o WhatsApp
+  res.sendStatus(200);
 });
 
 // 🚀 Inicialização
