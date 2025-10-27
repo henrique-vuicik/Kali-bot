@@ -1,111 +1,67 @@
-// === KALI (versão estável – 360dialog somente) ===
 const express = require("express");
-const bodyParser = require("body-parser");
 const axios = require("axios");
+const bodyParser = require("body-parser");
+require("dotenv").config();
 
 const app = express();
 app.use(bodyParser.json());
 
-// ---------- ENV ----------
 const PORT = process.env.PORT || 8080;
-const D360_API_KEY = process.env.D360_API_KEY;          // API Key do 360 (Hub)
-const TEST_TO = process.env.TEST_TO || "";              // Ex.: 554299401345 (E.164, sem +)
+const D360_API_KEY = process.env.D360_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const WHATSAPP_PHONE_NUMBER = process.env.WHATSAPP_PHONE_NUMBER;
 
-if (!D360_API_KEY) {
-  console.error("❌ D360_API_KEY ausente. Defina a variável no Railway.");
-  process.exit(1);
-}
-
-const D360_URL = "https://waba-v2.360dialog.io/v1/messages";
-
-// ---------- SENDERS ----------
-async function sendText360(to, body) {
-  const payload = { to, type: "text", text: { body } }; // formato 360 (sem messaging_product)
-  const resp = await axios.post(D360_URL, payload, {
-    headers: {
-      "D360-API-KEY": D360_API_KEY,
-      "Content-Type": "application/json"
-    },
-    validateStatus: () => true
-  });
-  if (resp.status >= 200 && resp.status < 300) return resp.data;
-  throw new Error(`360 ${resp.status}: ${JSON.stringify(resp.data)}`);
-}
-
-// ---------- HELPERS ----------
-function extractMessage(entry) {
-  // Webhook do 360 segue o padrão do WhatsApp Business:
-  // body.entry[0].changes[0].value.messages[0]
+// Função para enviar mensagens via 360dialog
+async function enviarMensagem(to, texto) {
   try {
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
-    const messages = value?.messages || [];
-    const contacts = value?.contacts || [];
-    const msg = messages[0];
-    const contact = contacts[0];
-
-    const from = msg?.from || contact?.wa_id;  // remetente
-    const type = msg?.type;                    // "text", "image", etc.
-    const text = msg?.text?.body;
-    const image = msg?.image;                  // { id, mime_type, sha256 }
-
-    return { from, type, text, image, raw: msg };
-  } catch {
-    return null;
+    await axios.post(
+      "https://waba-v2.360dialog.io/v1/messages",
+      {
+        to,
+        type: "text",
+        text: { body: texto },
+      },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "D360-API-KEY": D360_API_KEY,
+        },
+      }
+    );
+  } catch (err) {
+    console.error("🔥 Erro ao enviar mensagem:", err.response?.data || err.message);
   }
 }
 
-// ---------- ROUTES ----------
-app.get("/", (_req, res) => res.send("Kali (estável – 360) online ✅"));
-app.get("/health", async (_req, res) => {
-  try {
-    if (TEST_TO) await sendText360(TEST_TO, "Ping de saúde ✅ (360)");
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
+// Webhook principal
 app.post("/webhook", async (req, res) => {
   console.log("🟦 Webhook recebido");
+
   try {
-    const entry = req.body?.entry?.[0];
-    const msg = extractMessage(entry);
+    const message = req.body.messages?.[0];
+    if (!message) return res.sendStatus(200);
 
-    if (!msg) {
-      console.log("ℹ️  Sem mensagem válida no payload.");
-      return res.sendStatus(200);
-    }
+    const from = message.from;
+    const text = message.text?.body || "";
 
-    // Regras mínimas (estáveis):
-    if (msg.type === "text" && msg.text) {
-      // Resposta padrão estável p/ textos
-      const reply =
-        "Oi! 👋 Sou a Kali.\n" +
-        "• Posso conversar sobre sua dieta, calcular macros, registrar refeições por texto.\n" +
-        "• Envie uma *foto* do que comeu que eu acuso recebimento (análise por imagem virá depois).";
-      await sendText360(msg.from, reply);
-    } else if (msg.type === "image" && msg.image?.id) {
-      // Apenas acusar recebimento (sem análise de imagem nesta versão)
-      await sendText360(
-        msg.from,
-        "Recebi sua foto! ✅ Nesta versão estável não faço análise por imagem. "+
-        "Se preferir, descreva o que comeu que eu estimo as calorias. 🍽️"
-      );
+    if (text.toLowerCase().includes("oi")) {
+      await enviarMensagem(from, "Olá! Aqui é a Kali 😊");
     } else {
-      await sendText360(msg.from, "Mensagem recebida! ✅ (formato ainda não suportado nesta versão estável).");
+      await enviarMensagem(from, "Mensagem recebida! 💬");
     }
 
     res.sendStatus(200);
-  } catch (e) {
-    console.error("🔥 Erro no webhook:", e.message);
-    // Responder 200 para não gerar re-entrega infinita do WhatsApp
-    res.sendStatus(200);
+  } catch (err) {
+    console.error("🔥 Erro no webhook:", err.response?.data || err.message);
+    res.sendStatus(500);
   }
 });
 
-// ---------- START ----------
+app.get("/", (req, res) => {
+  res.send("🚀 Kali Nutro IA está online!");
+});
+
 app.listen(PORT, () => {
-  console.log(`🚀 Kali (estável – 360) na porta ${PORT}`);
-  console.log(`🔔 Endpoint 360: ${D360_URL}`);
+  console.log(`🟩 🚀 Kali Nutro IA rodando na porta ${PORT}`);
+  console.log("🔔 Endpoint primário: https://waba-v2.360dialog.io/v1/messages");
 });
