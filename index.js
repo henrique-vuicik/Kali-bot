@@ -1,16 +1,9 @@
-// index.js — Kali Nutro IA (Pro v3)
-// - ESM puro (package.json { "type": "module" })
-// - 360dialog v2 (mensaging_product obrigatório)
-// - Memória por usuário (em memória de processo)
-// - Foco rígido em nutrição/treino/suplementação (recusa outros temas)
-// - Log de alimentos com subtotal e resumo
-// - Identificação apenas quando perguntarem (quem é vc? qual seu nome?)
-// - Geração de dieta personalizada (pergunta preferências antes)
-// - Modelo: usa o endpoint chat/completions (4o/5-equivalente)
+// index.js — Kali Nutro IA (Pro v4: conversa fluida)
+// Requisitos: package.json { "type": "module" }, Node >=18
+// Variáveis: D360_API_KEY, OPENAI_API_KEY
 
 import express from 'express';
 import dotenv from 'dotenv';
-
 dotenv.config();
 
 const app = express();
@@ -20,321 +13,274 @@ const PORT = process.env.PORT || 8080;
 const D360_API_KEY = process.env.D360_API_KEY?.trim();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
 
-// ====== Memória em processo (por número/wa_id) ======
+// ---------------- Memória em processo ----------------
 /*
- state[wa_id] = {
-   name: "Kali", // fixo
-   day: "YYYY-MM-DD",
-   log: [{ whenISO, item, qty, unit, kcal, prot_g, carb_g, fat_g, note }],
-   targets: { kcal: 1600, protein_g: 120 }, // opcional
-   profile: { likes: [], dislikes: [], restrictions: [], goals: "" }
- }
+ctx = {
+  day: 'YYYY-MM-DD',
+  log: [{whenISO,item,qty,unit,prep,kcal,protein_g,carb_g,fat_g,note}],
+  profile: { likes:[], dislikes:[], restrictions:[], goals:'' },
+  history: [{role:'user'|'assistant', content:string}], // últimas ~10
+  pending: [{...items}] | null, // itens extraídos aguardando "pode somar"
+  greeted: boolean // já se apresentou 1x para esse wa_id
+}
 */
 const state = new Map();
-
-function todayStr() {
-  // Data local do container; como é log diário, suficiente.
-  return new Date().toISOString().slice(0, 10);
-}
-
-function ensureUser(wa_id) {
+const todayStr = () => new Date().toISOString().slice(0,10);
+function ensureCtx(wa_id){
   const day = todayStr();
-  if (!state.has(wa_id)) {
-    state.set(wa_id, { name: 'Kali', day, log: [], targets: null, profile: {} });
+  if(!state.has(wa_id)){
+    state.set(wa_id, { day, log:[], profile:{}, history:[], pending:null, greeted:false });
   }
   const ctx = state.get(wa_id);
-  if (ctx.day !== day) { // vira o dia → zera log
-    ctx.day = day;
-    ctx.log = [];
-  }
+  if(ctx.day!==day){ ctx.day=day; ctx.log=[]; ctx.pending=null; }
   return ctx;
 }
+function pushHistory(ctx, role, content){
+  ctx.history.push({ role, content: String(content).slice(0,800) });
+  if(ctx.history.length>20) ctx.history.splice(0, ctx.history.length-20);
+}
+const sumKcal = (log)=> Math.round(log.reduce((s,i)=>s+(+i.kcal||0),0));
 
-// ====== Utilidades ======
-async function sendText(to, body) {
-  const payload = {
-    messaging_product: 'whatsapp',
-    recipient_type: 'individual',
-    to: String(to),
-    type: 'text',
-    text: { body: String(body) }
-  };
-
-  try {
-    const resp = await fetch('https://waba-v2.360dialog.io/messages', {
-      method: 'POST',
-      headers: {
-        'D360-API-KEY': D360_API_KEY,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
+// ---------------- 360dialog ----------------
+async function sendText(to, body){
+  const payload = { messaging_product:'whatsapp', recipient_type:'individual', to:String(to), type:'text', text:{ body:String(body) } };
+  try{
+    const r = await fetch('https://waba-v2.360dialog.io/messages', {
+      method:'POST',
+      headers:{ 'D360-API-KEY':D360_API_KEY, 'Content-Type':'application/json','Accept':'application/json' },
       body: JSON.stringify(payload)
     });
-    const txt = await resp.text();
-    console.log(`➡️  360 status: ${resp.status} body: ${txt}`);
-    return { status: resp.status, body: txt };
-  } catch (err) {
-    console.error('❌ Erro 360dialog:', err);
-    return { error: String(err) };
+    const t = await r.text();
+    console.log(`➡️  360 status: ${r.status} body: ${t}`);
+    return { status:r.status, body:t };
+  }catch(e){
+    console.error('❌ 360:', e); return { error:String(e) };
   }
 }
 
-async function askOpenAI(messages, json = false) {
-  const body = {
-    model: 'gpt-4o', // mapeia para o mais novo disponível na API da sua conta
-    messages,
-    temperature: 0.2,
-    max_tokens: 600
-  };
-  if (json) body.response_format = { type: 'json_object' };
-
-  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
+// ---------------- OpenAI helpers ----------------
+async function askOpenAI(messages, {json=false, temp=0.25, tokens=600}={}){
+  const body = { model:'gpt-4o', messages, temperature:temp, max_tokens:tokens };
+  if(json) body.response_format = { type:'json_object' };
+  const res = await fetch('https://api.openai.com/v1/chat/completions',{
+    method:'POST',
+    headers:{ Authorization:`Bearer ${OPENAI_API_KEY}`, 'Content-Type':'application/json' },
     body: JSON.stringify(body)
   });
-
-  if (!resp.ok) {
-    const t = await resp.text();
-    throw new Error(`OpenAI ${resp.status}: ${t}`);
-  }
-  const data = await resp.json();
+  if(!res.ok){ throw new Error(`OpenAI ${res.status}: ${await res.text()}`); }
+  const data = await res.json();
   return data.choices?.[0]?.message?.content ?? '';
 }
 
-// ====== Prompts base ======
+// ---------------- Prompts ----------------
 const SYSTEM_CORE = `
 Você é a *Kali*, assistente do Dr. Henrique (nutrologia).
-Tarefa: conversar de forma leve, objetiva e **focada somente** em:
-- nutrição, contagem de calorias/macros, composição de alimentos
-- treino e gasto energético
-- suplementação e medicações relacionadas a emagrecimento/metabolismo (somente orientações gerais, sem prescrever).
-NUNCA responda perguntas fora desse escopo; redirecione gentilmente para nutrição/treino/suplementos.
+Aja em PT-BR, tom leve, direto, educado, com 1 emoji quando fizer sentido.
+FOCO: nutrição (calorias/macros), treino/gasto, suplementação e medicações do metabolismo (sem prescrever; orientações gerais).
+Se vier assunto fora do foco, responda em UMA linha redirecionando simpaticamente ao tema.
+Ao registrar alimento, preferir estimar e deixar claro suposições entre parênteses.
+Sempre que registrar item, retorne linha(s) + Subtotal do dia.
 
-Estilo: curto, claro, amigável, em PT-BR, emojis moderados quando couber. Evite fala robótica.
-Quando perguntarem "quem é você", "qual seu nome", "quem é vc", "o que você faz":
-  - apresente-se: "Oi! Eu sou a Kali, assistente do Dr. Henrique. Meu nome vem de caloria. Te ajudo a somar calorias do dia, tirar dúvidas e montar planos do seu jeito." 
-  - Só faça isso nessas perguntas (não cumprimente com essa apresentação em toda mensagem).
-
-Calorias:
-- Se o usuário disser "comi X", estime kcal e macros **porção informada**, use tabela brasileira/padrões médios.
-- Se faltar detalhe (gramas, preparo), assuma um padrão comum e avise entre parênteses.
-- Sempre que registrar um item, retorne **linha única + subtotal do dia** quando possível (formato abaixo).
-- Nunca diga "não entendi, pode repetir?" de forma vazia: em vez disso, peça exatamente o que falta (ex.: "quantos gramas?", "era frito ou cozido?").
-
-Formato de retorno ao registrar alimento (SEM markdown):
-• [item formatado]: [kcal] kcal
-Subtotal do dia: [soma] kcal
-(Diga "resumo" para ver tudo, "zerar" para limpar, ou continue mandando o que comeu.)
+Formato linhas (sem markdown):
+• [item] ([quantidade][un][, preparo?]): [kcal] kcal
+Depois, "Subtotal do dia: [kcal] kcal" e instruções curtas.
 `.trim();
 
 const SYSTEM_PARSER = `
-Retorne STRICT JSON para o que o usuário comeu, com este formato:
+Extraia da mensagem dados de alimentos e intenção. Responda STRICT JSON:
 {
-  "items": [
-    {
-      "item": "nome do alimento em PT-BR",
-      "qty": number, "unit": "g|ml|un",
-      "prep": "assado|cozido|frito|cru|nao_informado",
-      "kcal": number,
-      "protein_g": number, "carb_g": number, "fat_g": number,
-      "note": "observações curtas se assumiu padrão"
-    }
-  ],
-  "intent": "add|resume|reset|diet|identify|chat",
-  "missing": "campo que falta (se houver) ou vazio"
+ "items":[
+   {"item":"string","qty":number,"unit":"g|ml|un","prep":"cru|cozido|assado|frito|nao_informado","kcal":number,
+    "protein_g":number,"carb_g":number,"fat_g":number,"note":"se assumiu algo, ex.: (porção padrão 100g)"}
+ ],
+ "intent":"add|resume|reset|diet|identify|chat|confirm_add",
+ "missing":"", 
+ "reason":"curto motivo se não for possível"
 }
 Regras:
-- Se a mensagem for "resumo": intent=resume.
-- "zerar", "resetar", "limpar": intent=reset.
-- Se pedir dieta/plano: intent=diet.
-- Se perguntar nome/quem é você: intent=identify.
-- Fora de nutrição/treino/suplementos: intent=chat.
-- Para alimentos comuns sem quantidade informada, assuma padrão: 1 un ovo (50g), 1 banana prata (90g), arroz cozido 100g, etc.
-- kcal e macros devem ser números (sem texto). Use valores médios realistas.
+- "resumo|total|saldo": intent=resume
+- "zerar|limpar|resetar": intent=reset
+- "dieta|cardápio|plano": intent=diet
+- "quem é você|qual seu nome|quem é a kali": intent=identify
+- "soma|some|pode somar|adiciona|confirmo": intent=confirm_add
+- Pode haver vários itens na mesma frase ("100g de carne e 100g de arroz").
+- Se falta quantidade, assuma padrão realista (ex.: ovo 1un=70kcal ~50g; banana prata 90g; arroz cozido 100g; pastel 1un médio=250kcal).
+- Se marca/preparo afetarem, estime e registre em "note".
 `.trim();
 
-// ====== Handlers ======
-async function handleNutrition(wa_id, text) {
-  const ctx = ensureUser(wa_id);
+// ---------------- Núcleo de nutrição ----------------
+async function handleNutrition(wa_id, text){
+  const ctx = ensureCtx(wa_id);
 
-  // Primeira passada: classificar + extrair itens em JSON
+  // 1) apresentação só na 1ª interação do dia OU quando pedirem
+  const isIdentifyQ = /(quem é você|qual seu nome|quem é a kali)/i.test(text);
+  if((!ctx.greeted && /^(oi|ol[aá]|bom dia|boa tarde|boa noite)\b/i.test(text)) || isIdentifyQ){
+    ctx.greeted = true;
+    return `Oi! Eu sou a Kali, assistente do Dr. Henrique. Meu nome vem de *caloria*. Te ajudo a somar calorias do dia, tirar dúvidas e montar planos do seu jeito. O que você comeu por último? 🍽️`;
+  }
+
+  // 2) Parser tolerante
   let parsed;
-  try {
+  try{
     const content = await askOpenAI(
       [
-        { role: 'system', content: SYSTEM_PARSER },
-        { role: 'user', content: text }
+        { role:'system', content:SYSTEM_PARSER },
+        ...ctx.history.slice(-6), // dá contexto para "e o resto?"
+        { role:'user', content:text }
       ],
-      true
+      { json:true, temp:0.1 }
     );
     parsed = JSON.parse(content);
-  } catch (e) {
+  }catch(e){
     console.error('Parser falhou:', e.message);
-    return `Dei uma travadinha pra entender. Pode me dizer o alimento e a quantidade? (ex: "200 g de frango grelhado")`;
+    // pergunta objetiva em vez de "não entendi"
+    return `Me diz o alimento e a quantidade (ex.: "200 g de frango grelhado" ou "1 banana"). Posso estimar mesmo sem todos os detalhes. 🙂`;
   }
 
+  // 3) Intenções utilitárias
   const intent = parsed.intent || 'chat';
 
-  // 1) Identificação sob demanda
-  if (intent === 'identify') {
-    return `Oi! Eu sou a Kali, assistente do Dr. Henrique. Meu nome vem de *caloria*. Te ajudo a somar as calorias do dia, tirar dúvidas e montar planos do seu jeito. Quer começar me dizendo o que comeu agora há pouco?`;
+  if(intent==='resume'){
+    if(!ctx.log.length) return `Por aqui tá zerado. Me diga o que você comeu que eu somo.`;
+    const linhas = ctx.log.map(i=>`• ${i.item} (${i.qty}${i.unit}${i.prep&&i.prep!=='nao_informado'?`, ${i.prep}`:''}): ${Math.round(i.kcal)} kcal`);
+    return `${linhas.join('\n')}\n\nTotal do dia: ${sumKcal(ctx.log)} kcal\n(Envie "zerar" para limpar ou continue mandando o que comeu.)`;
   }
 
-  // 2) Resumo
-  if (intent === 'resume') {
-    if (!ctx.log.length) return `Seu dia está zerado. Me diga o que você comeu que eu vou somando aqui.`;
-    const tot = ctx.log.reduce((s, i) => s + (Number(i.kcal) || 0), 0);
-    const linhas = ctx.log.map(i => `• ${i.item} (${i.qty}${i.unit}${i.prep && i.prep!=='nao_informado' ? ', '+i.prep : ''}): ${Math.round(i.kcal)} kcal`);
-    return `${linhas.join('\n')}\n\nTotal do dia: ${Math.round(tot)} kcal\n(Envie "zerar" para limpar ou continue mandando o que comeu.)`;
+  if(intent==='reset'){
+    ctx.log=[]; ctx.pending=null;
+    return `Prontinho, limpei seu dia. Manda o próximo alimento que eu somo.`;
   }
 
-  // 3) Reset
-  if (intent === 'reset') {
-    ctx.log = [];
-    return `Prontinho! Zerei seu dia. Manda o próximo alimento que eu já somo.`;
-  }
-
-  // 4) Dieta personalizada (perguntas de preferências se ainda não houver perfil)
-  if (intent === 'diet') {
-    const wants = ctx.profile?.wants;
-    if (!wants) {
-      ctx.profile.wants = true; // marca que está no fluxo
-      return `Fechado! Vamos montar um plano do seu jeito. Me diz rapidinho:\n1) Quantas refeições por dia você prefere?\n2) Tem algo que quer *incluir* (ex: ovo, iogurte, frango, arroz)?\n3) Algo que quer *evitar* ou não come?\n4) Alguma meta (ex: ~1500 kcal e 140 g de proteína)?`;
+  if(intent==='diet'){
+    // coleta preferências se ainda não houver
+    const needs = !ctx.profile.likes && !ctx.profile.goals;
+    if(needs){
+      return `Fecho junto contigo! Antes, me diz rapidinho:\n1) Quantas refeições prefere no dia?\n2) O que você curte comer? (ex.: ovos, iogurte, frango, arroz)\n3) Algo a evitar?\n4) Meta de kcal/proteína (se tiver).`;
     }
-    // Se já respondeu preferências em mensagens anteriores, delega geração:
-    try {
+    try{
       const plan = await askOpenAI([
-        { role: 'system', content: SYSTEM_CORE },
-        { role: 'user', content: `Baseado nas preferências do usuário (mensagens anteriores) gere um cardápio de 1 dia com porções em gramas/ml e macros aproximadas por refeição, e total diário.` }
-      ]);
+        { role:'system', content:SYSTEM_CORE },
+        ...ctx.history.slice(-6),
+        { role:'user', content:`Com base nas preferências que eu já te falei, monte um cardápio de 1 dia com porções em g/ml, macros por refeição e total diário.` }
+      ], { temp:0.3, tokens:900 });
       return plan;
-    } catch (e) {
-      return `Tentei montar o plano mas deu erro momentâneo. Me manda suas preferências e metas em uma mensagem só, que eu gero em seguida.`;
+    }catch(e){
+      return `Tive um pico aqui. Me manda suas preferências e metas em uma mensagem só que eu monto já em seguida.`;
     }
   }
 
-  // 5) Chat dentro do escopo (nutrição/treino/suplementação)
-  if (intent === 'chat' && !(parsed.items?.length)) {
-    // Responder curto e focado
-    try {
-      const reply = await askOpenAI([
-        { role: 'system', content: SYSTEM_CORE },
-        { role: 'user', content: text }
-      ]);
-      return reply;
-    } catch (e) {
-      return `Posso te ajudar com nutrição, treino e suplementação. Quer falar sobre sua alimentação de hoje?`;
-    }
+  // 4) Confirmar itens pendentes (usuário disse "pode somar")
+  if(intent==='confirm_add'){
+    if(!ctx.pending?.length) return `Me diz o alimento e a quantidade que eu já somo aqui.`;
+    for(const it of ctx.pending){ ctx.log.push(it); }
+    const added = ctx.pending.map(rec=>`• ${rec.item} (${rec.qty}${rec.unit}${rec.prep&&rec.prep!=='nao_informado'?`, ${rec.prep}`:''}): ${Math.round(rec.kcal)} kcal`);
+    ctx.pending = null;
+    return `${added.join('\n')}\n\nSubtotal do dia: ${sumKcal(ctx.log)} kcal\n("resumo" para ver tudo, ou continue mandando o que comeu.)`;
   }
 
-  // 6) Adicionar itens (somar)
-  if (parsed.items?.length) {
-    let added = [];
-    for (const it of parsed.items) {
-      const rec = {
-        whenISO: new Date().toISOString(),
-        item: it.item,
-        qty: Number(it.qty) || 1,
-        unit: it.unit || 'un',
-        prep: it.prep || 'nao_informado',
-        kcal: Number(it.kcal) || 0,
-        protein_g: Number(it.protein_g) || 0,
-        carb_g: Number(it.carb_g) || 0,
-        fat_g: Number(it.fat_g) || 0,
-        note: it.note || ''
-      };
-      ctx.log.push(rec);
-      added.push(`• ${rec.item} (${rec.qty}${rec.unit}${rec.prep && rec.prep!=='nao_informado' ? ', '+rec.prep : ''}): ${Math.round(rec.kcal)} kcal`);
+  // 5) Registrar itens (ou deixar pendente se estiver ambíguo)
+  if(parsed.items?.length){
+    // Transforma itens em registros padronizados
+    const regs = parsed.items.map(it=>({
+      whenISO: new Date().toISOString(),
+      item: it.item,
+      qty: Number(it.qty)||1,
+      unit: it.unit||'un',
+      prep: it.prep||'nao_informado',
+      kcal: Number(it.kcal)||0,
+      protein_g: Number(it.protein_g)||0,
+      carb_g: Number(it.carb_g)||0,
+      fat_g: Number(it.fat_g)||0,
+      note: it.note||''
+    }));
+
+    // Heurística: se o parser sinalizou "missing" e for algo crítico (ex.: quantidade),
+    // **mantém pendente** e pede só o que falta, mas já mostra a prévia.
+    const missing = (parsed.missing||'').toLowerCase();
+    if(missing.includes('quant') || missing.includes('gram') || missing.includes('ml')){
+      ctx.pending = regs;
+      const preview = regs.map(r=>`• ${r.item} (${r.qty}${r.unit}${r.prep&&r.prep!=='nao_informado'?`, ${r.prep}`:''}): ~${Math.round(r.kcal)} kcal`).join('\n');
+      return `${preview}\n\nSó me confirma a quantidade exata pra eu somar de vez, pode ser?`;
     }
-    const subtotal = ctx.log.reduce((s, i) => s + (Number(i.kcal) || 0), 0);
-    return `${added.join('\n')}\n\nSubtotal do dia: ${Math.round(subtotal)} kcal\n(Diga "resumo" para ver tudo, "zerar" para limpar, ou continue mandando o que comeu.)`;
+
+    // Caso normal: soma direto
+    const added = [];
+    for(const r of regs){ ctx.log.push(r); added.push(`• ${r.item} (${r.qty}${r.unit}${r.prep&&r.prep!=='nao_informado'?`, ${r.prep}`:''}): ${Math.round(r.kcal)} kcal`); }
+    return `${added.join('\n')}\n\nSubtotal do dia: ${sumKcal(ctx.log)} kcal\n(Diga "resumo" para ver tudo, "zerar" para limpar, ou continue mandando o que comeu.)`;
   }
 
-  // 7) Fallback
-  return `Me conta o alimento e a quantidade (ex: "150 g de frango grelhado" ou "1 banana"). Eu já somo por aqui.`;
+  // 6) Chat dentro do foco (nutrição/treino/suplementos) — fluido
+  try{
+    const reply = await askOpenAI([
+      { role:'system', content:SYSTEM_CORE },
+      ...ctx.history.slice(-6),
+      { role:'user', content:text }
+    ], { temp:0.35, tokens:450 });
+    return reply.length>2 ? reply : `Me conta o alimento e a quantidade que eu já somo aqui.`;
+  }catch(e){
+    return `Pode me dizer o alimento e a quantidade? Ex.: "1 pastel de queijo" ou "120 g de arroz cozido".`;
+  }
 }
 
-// ====== Rotas ======
-app.get('/', (_req, res) => {
-  res.send('✅ Kali Nutro IA Pro v3 online');
-});
+// ---------------- Rotas ----------------
+app.get('/', (_req,res)=> res.send('✅ Kali Nutro IA Pro v4 online'));
 
-app.post('/webhook', async (req, res) => {
-  try {
+app.post('/webhook', async (req,res)=>{
+  try{
     console.log('🟦 Webhook recebido');
     console.log('↩️ body:', JSON.stringify(req.body));
-    res.status(200).send('OK'); // responde rápido
+    res.status(200).send('OK');
 
-    const entry = req.body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value;
-    const messages = value?.messages;
-    if (!messages || !Array.isArray(messages)) {
-      console.log('⚠️ Sem mensagens processáveis');
-      return;
-    }
+    const value = req.body?.entry?.[0]?.changes?.[0]?.value;
+    const msgs = value?.messages;
+    if(!Array.isArray(msgs)) return;
 
-    for (const msg of messages) {
+    for(const msg of msgs){
       const from = msg.from;
       const type = msg.type;
-      console.log(`💬 de ${from}: tipo=${type}`);
+      const ctx = ensureCtx(from);
 
-      if (type !== 'text' || !msg.text?.body) {
-        await sendText(from, 'Pode me mandar por texto? Assim eu somo direitinho as calorias. 😊');
+      if(type !== 'text' || !msg.text?.body){
+        await sendText(from, 'Me manda por texto pra eu somar certinho as calorias, por favor 😉');
         continue;
       }
 
-      const text = String(msg.text.body || '').trim();
+      const text = String(msg.text.body||'').trim();
+      console.log(`💬 de ${from}: ${text}`);
+      pushHistory(ctx,'user',text);
 
-      // Hard-guard contra assuntos fora do escopo (ex.: “quem descobriu o Brasil?”)
-      const offTopicRegex = /(quem descobriu|porsche|carro mais rápido|cotação|política|história do brasil|futebol|tempo em )/i;
-      if (offTopicRegex.test(text)) {
-        await sendText(from, 'Eu fico só no time da nutrição, treino e suplementação 😉. Quer falar do que você comeu agora ou tirar uma dúvida de alimentos?');
+      // Soft off-topic: só redireciona sem travar
+      const off = /(quem descobriu|porsche|cotação|política|história do brasil|futebol|clima|tempo|imposto|trânsito)/i;
+      if(off.test(text)){
+        const nudge = 'Eu fico no time da nutrição, treino e suplementação 😉. Quer falar do que você comeu agora ou tirar uma dúvida de alimentos?';
+        pushHistory(ctx,'assistant',nudge);
+        await sendText(from, nudge);
         continue;
       }
 
-      // Identificação sob demanda (atajos simples)
-      const identRegex = /(quem é você|quem é vc|qual seu nome|quem é a kali)/i;
-      if (identRegex.test(text)) {
-        await sendText(from, 'Oi! Eu sou a Kali, assistente do Dr. Henrique. Meu nome vem de *caloria*. Te ajudo a somar as calorias do dia, tirar dúvidas e montar planos do seu jeito. Quer começar me dizendo o que comeu agora há pouco?');
-        continue;
-      }
+      let out = await handleNutrition(from, text);
 
-      // Núcleo de nutrição
-      let reply;
-      try {
-        reply = await handleNutrition(from, text);
-      } catch (e) {
-        console.error('Erro handleNutrition:', e);
-        reply = 'Deu uma oscilada por aqui. Me manda de novo o alimento e a quantidade que eu já somo. 🙏';
-      }
-      await sendText(from, reply);
+      // Atualiza histórico e envia
+      pushHistory(ctx,'assistant',out);
+      await sendText(from, out);
     }
-  } catch (err) {
-    console.error('🔥 Erro no /webhook:', err);
-    try { res.status(500).send('erro'); } catch {}
+  }catch(e){
+    console.error('🔥 Erro /webhook:', e);
+    try{ res.status(500).send('erro'); }catch{}
   }
 });
 
-// Envio manual para teste
-app.post('/send', async (req, res) => {
-  const { to, body } = req.body || {};
-  if (!to || !body) return res.status(400).json({ error: 'to e body obrigatórios' });
-  try {
-    const r = await sendText(to, body);
-    res.json(r);
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
+// Teste manual
+app.post('/send', async (req,res)=>{
+  const {to, body} = req.body||{};
+  if(!to||!body) return res.status(400).json({error:'to e body obrigatórios'});
+  const r = await sendText(to, body);
+  res.json(r);
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Kali Nutro IA Pro v3 rodando na porta ${PORT}`);
+app.listen(PORT, ()=>{
+  console.log(`🚀 Kali Nutro IA Pro v4 rodando na porta ${PORT}`);
   console.log(`🔔 Endpoint 360: https://waba-v2.360dialog.io/messages`);
-  if (!D360_API_KEY) console.warn('⚠️ D360_API_KEY não configurado');
-  if (!OPENAI_API_KEY) console.warn('⚠️ OPENAI_API_KEY não configurado');
+  if(!D360_API_KEY) console.warn('⚠️ D360_API_KEY não configurado');
+  if(!OPENAI_API_KEY) console.warn('⚠️ OPENAI_API_KEY não configurado');
 });
