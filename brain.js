@@ -6,26 +6,23 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 // memória ingênua por usuário em RAM
 const memory = new Map();
-function getHistory(id) { return memory.get(id) || []; }
-function pushMemory(id, role, content) {
+const getHistory = (id) => memory.get(id) || [];
+const pushMemory = (id, role, content) => {
   const arr = getHistory(id);
   arr.push({ role, content });
   while (arr.length > 12) arr.shift();
   memory.set(id, arr);
-}
+};
 
-function sys(name='Paciente') {
-  return [
-    'Você é a Kali, assistente de nutrologia do Dr. Henrique Vuicik.',
-    'Fale em português, breve, empática e orientativa.',
-    'Evite diagnósticos fechados; priorize educação e segurança.',
-    'Para casos clínicos, sugira avaliação com o médico.',
-    `O usuário chama-se ${name}.`
-  ].join(' ');
-}
+const sys = (name = 'Paciente') => [
+  'Você é a Kali, assistente de nutrologia do Dr. Henrique Vuicik.',
+  'Fale em português, breve, empática e orientativa.',
+  'Evite diagnósticos fechados; priorize educação e segurança.',
+  'Para casos clínicos, sugira avaliação com o médico.',
+  `O usuário chama-se ${name}.`
+].join(' ');
 
-export async function aiReply(wa_id, userText, profileName='Paciente') {
-  // sem chave? devolve resposta simples para não quebrar
+async function aiReply(wa_id, userText, profileName = 'Paciente') {
   if (!process.env.OPENAI_API_KEY) {
     return 'Oi! Sou a Kali 😊. Posso ajudar com nutrologia e hábitos. Conte-me sua dúvida.';
   }
@@ -54,3 +51,6 @@ export async function aiReply(wa_id, userText, profileName='Paciente') {
     return 'Tive um probleminha para pensar nisso agora 😅. Pode repetir em outras palavras?';
   }
 }
+
+export default aiReply;   // <-- default
+export { aiReply };       // <-- named também
