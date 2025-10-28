@@ -1,8 +1,8 @@
-// index.js — versão estável (ESM completa e corrigida)
+// index.js — versão com OpenAI integrada
 
 import express from 'express';
 import dotenv from 'dotenv';
-import process from 'process';
+import { Configuration, OpenAIApi } from 'openai';
 
 dotenv.config();
 
@@ -10,18 +10,28 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
-const D360_API_KEY = process.env.D360_API_KEY; // chave do número (Numbers -> Show API Key)
+const D360_API_KEY = process.env.D360_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
+// Validações iniciais
 if (!D360_API_KEY) {
   console.warn('⚠️ D360_API_KEY não configurado — defina no Railway / Variables');
 }
+if (!OPENAI_API_KEY) {
+  console.warn('⚠️ OPENAI_API_KEY não configurado — defina no Railway / Variables');
+}
+
+// Inicialização da OpenAI
+const openai = new OpenAIApi(new Configuration({
+  apiKey: OPENAI_API_KEY,
+}));
 
 /**
  * Envia texto via 360dialog v2
  */
 async function sendText(to, body) {
   const payload = {
-    messaging_product: 'whatsapp',       // ⚠️ obrigatório
+    messaging_product: 'whatsapp',
     recipient_type: 'individual',
     to: String(to),
     type: 'text',
@@ -40,7 +50,7 @@ async function sendText(to, body) {
     });
 
     const respText = await resp.text();
-    console.log(`➡️  360 status: ${resp.status} body: ${respText}`);
+    console.log(`➡️ 360 status: ${resp.status} body: ${respText}`);
     return { status: resp.status, body: respText };
   } catch (err) {
     console.error('❌ Erro ao chamar 360dialog:', err);
@@ -52,7 +62,7 @@ async function sendText(to, body) {
  * Health check
  */
 app.get('/', (req, res) => {
-  res.send('✅ Kali Nutro IA estável rodando');
+  res.send('✅ Kali Nutro IA com OpenAI estável rodando');
 });
 
 /**
@@ -86,7 +96,30 @@ app.post('/webhook', async (req, res) => {
         const received = msg.text.body;
         console.log(`📥 recebido: ${received}`);
 
-        await sendText(from, `Recebi: ${received} ✅`);
+        // Resposta com OpenAI para informações nutricionais
+        try {
+          const openaiResponse = await openai.createChatCompletion({
+            model: "gpt-4-turbo",
+            messages: [
+              {
+                role: "system",
+                content: "Você é um nutricionista especializado. Forneça informações precisas sobre calorias, macronutrientes e benefícios nutricionais de alimentos comuns no Brasil. Responda em português com até 80 palavras e inclua valor calórico quando possível. Assine como 'Dr. Henrique Vuicik - CRM-PR 28088'."
+              },
+              {
+                role: "user",
+                content: `Quantas calorias tem ${received}? Quais são seus principais nutrientes?`
+              }
+            ],
+            temperature: 0.5,
+            max_tokens: 200
+          });
+
+          const aiResponse = openaiResponse.data.choices[0].message.content;
+          await sendText(from, aiResponse);
+        } catch (openaiError) {
+          console.error("Erro OpenAI:", openaiError);
+          await sendText(from, "Desculpe, não consegui obter as informações nutricionais no momento. Tente novamente em instantes.");
+        }
       } else {
         await sendText(from, 'Recebi sua mensagem. Obrigado! 🙏');
       }
@@ -113,6 +146,7 @@ app.post('/send', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Kali Nutro IA estável rodando na porta ${PORT}`);
+  console.log(`🚀 Kali Nutro IA com OpenAI estável rodando na porta ${PORT}`);
   console.log(`🔔 Endpoint 360: https://waba-v2.360dialog.io/messages`);
+  console.log(`🧠 OpenAI integrada e pronta para calcular calorias`);
 });
