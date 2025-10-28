@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
-const D360_ENDPOINT = 'https://waba-v2.360dialog.io/v1/messages';
+const SEND_URL = 'https://waba-v2.360dialog.io/messages'; // ✅ sem /v1
 const D360_API_KEY = process.env.D360_API_KEY;
 
 // Envia texto pelo 360dialog
