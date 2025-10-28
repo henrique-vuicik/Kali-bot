@@ -1,8 +1,7 @@
 // index.js — ES Module
-import express from "express";
-import dotenv from "dotenv";
-import process from "process";
-import { thinkReply } from "./brain.js";
+import express from 'express';
+import dotenv from 'dotenv';
+import process from 'process';
 
 dotenv.config();
 
@@ -13,34 +12,29 @@ const PORT = process.env.PORT || 8080;
 const D360_API_KEY = process.env.D360_API_KEY; // Numbers -> Show API Key
 
 if (!D360_API_KEY) {
-  console.warn("⚠️ D360_API_KEY não configurado — configure no Railway / env vars");
+  console.warn('⚠️ D360_API_KEY não configurado — configure no Railway / env vars');
 }
 
 /**
  * Envia texto via 360dialog v2
- * Payload CORRETO (sem messaging_product):
- * {
- *   recipient_type: 'individual',
- *   to: '55429xxxxxxx',
- *   type: 'text',
- *   text: { body: 'mensagem' }
- * }
+ * Payload (v2) precisa do campo messaging_product: "whatsapp"
  */
 async function sendText(to, body) {
   const payload = {
-    recipient_type: "individual",
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
     to: String(to),
-    type: "text",
+    type: 'text',
     text: { body: String(body) }
   };
 
   try {
-    const resp = await fetch("https://waba-v2.360dialog.io/messages", {
-      method: "POST",
+    const resp = await fetch('https://waba-v2.360dialog.io/messages', {
+      method: 'POST',
       headers: {
-        "D360-API-KEY": D360_API_KEY,
-        "Content-Type": "application/json",
-        Accept: "application/json"
+        'D360-API-KEY': D360_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
       },
       body: JSON.stringify(payload)
     });
@@ -49,24 +43,22 @@ async function sendText(to, body) {
     console.log(`➡️  360 status: ${resp.status} body: ${respText}`);
     return { status: resp.status, body: respText };
   } catch (err) {
-    console.error("Erro ao chamar 360dialog:", err);
+    console.error('Erro ao chamar 360dialog:', err);
     throw err;
   }
 }
 
 // Health
-app.get("/", (_req, res) => {
-  res.send("Kali Nutro IA estável");
+app.get('/', (_req, res) => {
+  res.send('Kali Nutro IA estável');
 });
 
-// Webhook (recebe eventos do WhatsApp/360dialog)
-app.post("/webhook", async (req, res) => {
+// Webhook (WABA -> seu servidor)
+app.post('/webhook', async (req, res) => {
   try {
-    console.log("🟦 Webhook recebido");
-    console.log("↩️ body:", JSON.stringify(req.body));
-
-    // responde rápido para o WABA não reenviar
-    res.status(200).send("OK");
+    console.log('🟦 Webhook recebido');
+    console.log('↩️ body:', JSON.stringify(req.body));
+    res.status(200).send('OK'); // responde rápido pro WABA não reenviar
 
     const entry = req.body?.entry?.[0];
     const changes = entry?.changes?.[0];
@@ -74,45 +66,38 @@ app.post("/webhook", async (req, res) => {
     const messages = value?.messages;
 
     if (!messages || !Array.isArray(messages)) {
-      console.log("Nenhuma mensagem processável encontrada no webhook.");
+      console.log('Nenhuma mensagem processável encontrada no webhook.');
       return;
     }
 
     for (const msg of messages) {
-      const from = msg.from; // ex: 55429...
-      const type = msg.type;
-      console.log(`💬 de ${from}: tipo=${type}`);
-
       try {
-        if (type === "text" && msg.text?.body) {
+        const from = msg.from;
+        const type = msg.type;
+        console.log(`💬 de ${from}: tipo=${type}`);
+
+        if (type === 'text' && msg.text?.body) {
           const received = msg.text.body;
           console.log(`📥 recebido: ${received}`);
-
-          // ===== inteligência =====
-          const reply = await thinkReply(received);
-          await sendText(from, reply);
+          await sendText(from, `Recebi: ${received} ✅`);
         } else {
-          await sendText(from, "Recebi sua mensagem. Obrigado!");
+          await sendText(from, 'Recebi sua mensagem. Obrigado!');
         }
       } catch (innerErr) {
-        console.error("Erro ao processar mensagem individual:", innerErr);
-        try {
-          await sendText(from, "Tive um problema ao responder agora. Pode repetir?");
-        } catch {}
+        console.error('Erro ao processar mensagem individual:', innerErr);
       }
     }
   } catch (err) {
-    console.error("Erro no endpoint /webhook:", err);
-    try {
-      res.status(500).send("erro");
-    } catch {}
+    console.error('Erro no endpoint /webhook:', err);
+    try { res.status(500).send('erro'); } catch {}
   }
 });
 
-// Endpoint opcional para testes manuais
-app.post("/send", async (req, res) => {
+// Endpoint opcional para teste manual
+// POST /send { "to": "55429...", "body": "texto" }
+app.post('/send', async (req, res) => {
   const { to, body } = req.body || {};
-  if (!to || !body) return res.status(400).json({ error: "to e body obrigatórios" });
+  if (!to || !body) return res.status(400).json({ error: 'to e body obrigatórios' });
 
   try {
     const resp = await sendText(to, body);
