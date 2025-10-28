@@ -1,78 +1,97 @@
-// brain.js — ES Module
-import OpenAI from 'openai';
+// index.js — ES Module
+import express from 'express';
+import dotenv from 'dotenv';
+import process from 'process';
+import { aiReply } from './brain.js'; // <-- arquivo deve ser exatamente "brain.js" (minúsculo) na raiz
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
+dotenv.config();
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+const app = express();
+app.use(express.json());
 
-// memória simples em RAM (por wa_id)
-const memory = new Map();
+const PORT = process.env.PORT || 8080;
+const D360_API_KEY = process.env.D360_API_KEY;
 
-function getHistory(wa_id) {
-  return memory.get(wa_id) || [];
-}
-function pushMemory(wa_id, role, content) {
-  const arr = getHistory(wa_id);
-  arr.push({ role, content, ts: Date.now() });
-  // limita histórico para não estourar tokens
-  while (arr.length > 12) arr.shift();
-  memory.set(wa_id, arr);
-}
-
-function systemPrompt(profileName = 'Paciente') {
-  return [
-    'Você é a Kali, assistente de nutrologia do Dr. Henrique Vuicik.',
-    'Fale em português, de forma breve, empática e orientativa.',
-    'Evite diagnósticos fechados; ofereça educação, segurança e próximos passos.',
-    'Se for tema clínico delicado, sugira avaliação presencial com o médico.',
-    `O usuário chama-se ${profileName}.`
-  ].join(' ');
-}
-
-/**
- * Gera a resposta da IA
- * @param {string} wa_id - número do WhatsApp do usuário
- * @param {string} userText - texto recebido do usuário
- * @param {string} profileName - nome do contato (opcional)
- * @returns {Promise<string>}
- */
-export async function aiReply(wa_id, userText, profileName = 'Paciente') {
-  // guarda a fala do usuário no histórico
-  pushMemory(wa_id, 'user', userText);
-
-  // monta mensagens p/ OpenAI
-  const history = getHistory(wa_id)
-    .map(m => ({ role: m.role, content: m.content }));
-
-  const messages = [
-    { role: 'system', content: systemPrompt(profileName) },
-    ...history
-  ];
+// --- 360 v2: envio de texto ---
+async function sendText(to, body) {
+  const payload = {
+    recipient_type: 'individual',
+    to: String(to),
+    type: 'text',
+    text: { body: String(body) }
+  };
 
   try {
-    if (!process.env.OPENAI_API_KEY) {
-      // fallback se não houver chave
-      return 'Oi! Sou a Kali 😊. Posso te ajudar com dúvidas sobre nutrologia e seu acompanhamento.';
-    }
-
-    const resp = await client.chat.completions.create({
-      model: OPENAI_MODEL,      // ajuste via env se quiser
-      messages,
-      max_tokens: 300,
-      temperature: 0.5
+    const resp = await fetch('https://waba-v2.360dialog.io/messages', {
+      method: 'POST',
+      headers: {
+        'D360-API-KEY': D360_API_KEY || '',
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify(payload)
     });
-
-    const text =
-      resp.choices?.[0]?.message?.content?.trim() ||
-      'Certo! Como posso te ajudar?';
-
-    // guarda resposta no histórico
-    pushMemory(wa_id, 'assistant', text);
-    return text;
-  } catch (err) {
-    console.error('Erro na IA:', err);
-    return 'Tive um probleminha aqui para pensar sobre isso agora 😅. Pode repetir ou tentar de novo?';
+    const txt = await resp.text();
+    console.log(`➡️  360 status: ${resp.status} body: ${txt}`);
+    return { status: resp.status, body: txt };
+  } catch (e) {
+    console.error('❌ Erro ao chamar 360:', e);
+    return { status: 0, body: String(e) };
   }
 }
+
+app.get('/', (_req, res) => res.send('Kali Nutro IA estável'));
+
+app.post('/webhook', async (req, res) => {
+  try {
+    console.log('🟦 Webhook recebido');
+    console.log('↩️ body:', JSON.stringify(req.body));
+    // responde rápido para o 360 não reenviar
+    res.status(200).send('OK');
+
+    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    const from = msg?.from;
+    const type = msg?.type;
+    if (!from || !type) return;
+
+    console.log(`💬 de ${from}: tipo=${type}`);
+
+    // só tratamos texto aqui; demais tipos, manda resposta padrão
+    if (type !== 'text') {
+      await sendText(from, 'Recebi sua mensagem 👍');
+      return;
+    }
+
+    const textIn = msg.text?.body || '';
+    console.log(`📥 recebido: ${textIn}`);
+
+    // =========== IA com fallback ===========
+    let out = null;
+    try {
+      out = await aiReply(from, textIn, req.body?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name || 'Paciente');
+    } catch (e) {
+      console.error('⚠️ Falha aiReply:', e);
+    }
+
+    if (!out || typeof out !== 'string') {
+      out = `Recebi: ${textIn} ✅`; // fallback seguro
+    }
+
+    await sendText(from, out);
+  } catch (err) {
+    console.error('Erro no /webhook:', err);
+    try { res.status(200).end(); } catch {}
+  }
+});
+
+app.post('/send', async (req, res) => {
+  const { to, body } = req.body || {};
+  if (!to || !body) return res.status(400).json({ error: 'to e body obrigatórios' });
+  const resp = await sendText(to, body);
+  res.json(resp);
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 Kali Nutro IA estável rodando na porta ${PORT}`);
+  console.log(`🔔 Endpoint 360: https://waba-v2.360dialog.io/messages`);
+});
