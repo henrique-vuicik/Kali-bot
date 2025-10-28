@@ -1,8 +1,7 @@
-// index.js — versão com OpenAI integrada
+// index.js — versão corrigida e funcional com OpenAI
 
 import express from 'express';
 import dotenv from 'dotenv';
-import { Configuration, OpenAIApi } from 'openai';
 
 dotenv.config();
 
@@ -20,11 +19,6 @@ if (!D360_API_KEY) {
 if (!OPENAI_API_KEY) {
   console.warn('⚠️ OPENAI_API_KEY não configurado — defina no Railway / Variables');
 }
-
-// Inicialização da OpenAI
-const openai = new OpenAIApi(new Configuration({
-  apiKey: OPENAI_API_KEY,
-}));
 
 /**
  * Envia texto via 360dialog v2
@@ -96,26 +90,39 @@ app.post('/webhook', async (req, res) => {
         const received = msg.text.body;
         console.log(`📥 recebido: ${received}`);
 
-        // Resposta com OpenAI para informações nutricionais
+        // Resposta com OpenAI para informações nutricionais usando proxy
         try {
-          const openaiResponse = await openai.createChatCompletion({
-            model: "gpt-4-turbo",
-            messages: [
-              {
-                role: "system",
-                content: "Você é um nutricionista especializado. Forneça informações precisas sobre calorias, macronutrientes e benefícios nutricionais de alimentos comuns no Brasil. Responda em português com até 80 palavras e inclua valor calórico quando possível. Assine como 'Dr. Henrique Vuicik - CRM-PR 28088'."
-              },
-              {
-                role: "user",
-                content: `Quantas calorias tem ${received}? Quais são seus principais nutrientes?`
-              }
-            ],
-            temperature: 0.5,
-            max_tokens: 200
+          const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${OPENAI_API_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              model: 'gpt-4-turbo',
+              messages: [
+                {
+                  role: 'system',
+                  content: 'Você é um nutricionista especializado. Forneça informações precisas sobre calorias, macronutrientes e benefícios nutricionais de alimentos comuns no Brasil. Responda em português com até 80 palavras e inclua valor calórico quando possível. Assine como "Dr. Henrique Vuicik - CRM-PR 28088".'
+                },
+                {
+                  role: 'user',
+                  content: `Quantas calorias tem ${received}? Quais são seus principais nutrientes?`
+                }
+              ],
+              temperature: 0.5,
+              max_tokens: 200
+            })
           });
 
-          const aiResponse = openaiResponse.data.choices[0].message.content;
-          await sendText(from, aiResponse);
+          const data = await openaiResponse.json();
+          
+          if (data.choices && data.choices.length > 0) {
+            const aiResponse = data.choices[0].message.content;
+            await sendText(from, aiResponse);
+          } else {
+            await sendText(from, 'Desculpe, não consegui obter as informações nutricionais no momento.');
+          }
         } catch (openaiError) {
           console.error("Erro OpenAI:", openaiError);
           await sendText(from, "Desculpe, não consegui obter as informações nutricionais no momento. Tente novamente em instantes.");
@@ -148,5 +155,5 @@ app.post('/send', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 Kali Nutro IA com OpenAI estável rodando na porta ${PORT}`);
   console.log(`🔔 Endpoint 360: https://waba-v2.360dialog.io/messages`);
-  console.log(`🧠 OpenAI integrada e pronta para calcular calorias`);
+  console.log(`🧠 OpenAI integrada via API direta`);
 });
