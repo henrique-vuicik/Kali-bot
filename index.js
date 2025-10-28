@@ -2,7 +2,7 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import process from 'process';
-import { aiReply } from './brain.js'; // <-- arquivo deve ser exatamente "brain.js" (minúsculo) na raiz
+import aiReply from './brain.js'; // <-- usa export default, sem chaves
 
 dotenv.config();
 
@@ -46,7 +46,6 @@ app.post('/webhook', async (req, res) => {
   try {
     console.log('🟦 Webhook recebido');
     console.log('↩️ body:', JSON.stringify(req.body));
-    // responde rápido para o 360 não reenviar
     res.status(200).send('OK');
 
     const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
@@ -56,7 +55,6 @@ app.post('/webhook', async (req, res) => {
 
     console.log(`💬 de ${from}: tipo=${type}`);
 
-    // só tratamos texto aqui; demais tipos, manda resposta padrão
     if (type !== 'text') {
       await sendText(from, 'Recebi sua mensagem 👍');
       return;
@@ -65,18 +63,15 @@ app.post('/webhook', async (req, res) => {
     const textIn = msg.text?.body || '';
     console.log(`📥 recebido: ${textIn}`);
 
-    // =========== IA com fallback ===========
     let out = null;
     try {
-      out = await aiReply(from, textIn, req.body?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name || 'Paciente');
+      const name = req.body?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name || 'Paciente';
+      out = await aiReply(from, textIn, name);
     } catch (e) {
       console.error('⚠️ Falha aiReply:', e);
     }
 
-    if (!out || typeof out !== 'string') {
-      out = `Recebi: ${textIn} ✅`; // fallback seguro
-    }
-
+    if (!out || typeof out !== 'string') out = `Recebi: ${textIn} ✅`;
     await sendText(from, out);
   } catch (err) {
     console.error('Erro no /webhook:', err);
