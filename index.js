@@ -1,7 +1,8 @@
-// index.js — Kali Nutro IA (calorias inteligentes + memória por usuário)
+// index.js — Kali Nutro IA focada em nutrição, com soma de calorias e memória diária
 
 import express from 'express';
 import dotenv from 'dotenv';
+
 dotenv.config();
 
 const app = express();
@@ -10,209 +11,109 @@ app.use(express.json());
 const PORT = process.env.PORT || 8080;
 const D360_API_KEY = process.env.D360_API_KEY?.trim();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
-const OPENAI_MODEL = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini';
 
-/* =========================
-   MEMÓRIA POR USUÁRIO (RAM)
-   ========================= */
-const users = new Map();
-function getUser(waId) {
-  if (!users.has(waId)) {
-    users.set(waId, {
-      introduced: false,
-      profile: {
-        objetivo: null,
-        kcalMeta: null,
-        proteinaMeta: null,
-        gosta: [],
-        naoGosta: [],
-        alergias: []
-      },
-      lastSeen: Date.now()
-    });
-  }
-  return users.get(waId);
-}
+// --- Sessões em memória (por usuário) ---
+/**
+ * Estrutura:
+ * sessions[wa_id] = {
+ *   date: 'YYYY-MM-DD',
+ *   items: [{ desc, kcal }],
+ *   total: number
+ * }
+ */
+const sessions = Object.create(null);
+const todayStr = () => new Date().toLocaleDateString('sv-SE'); // YYYY-MM-DD
 
-/* ==============================
-   TEXTOS, DETECTORES E HELPERS
-   ============================== */
-const KALI_INTRO = `Oi! Eu sou a *Kali*, assistente do Dr. Henrique. ✨
-Meu nome vem de *caloria*! Tô aqui pra somar suas calorias do dia, tirar dúvidas de nutrição/treino/medicações e montar planos do seu jeito. 🙂`;
+// --- Tabela simples de alimentos (kcal por unidade base) ---
+const FOOD_DB = [
+  // por 100 g
+  { key: /arroz( branco)?( cozido)?/i, base: '100g', kcal: 128 },
+  { key: /(carne|bife|patinho|coxão|alcatra)/i, base: '100g', kcal: 250 },    // média
+  { key: /(frango|peito de frango)/i, base: '100g', kcal: 165 },
+  { key: /(banana)/i, base: '100g', kcal: 89 },
+  { key: /(salada de frutas?)/i, base: '100g', kcal: 60 },
 
-function norm(s='') { return s.toLowerCase().normalize('NFD').replace(/\p{Diacritic}/gu,''); }
-function quickGreeting(t) { return /^\s*(oi|ola|ol[aá]|bom dia|boa tarde|boa noite)\b/i.test(t||''); }
-function isIdentityQuestion(text) {
-  const t = norm(text);
-  return /(quem e voce|quem e vc|qual seu nome|seu nome|o que voce faz|kali\??|assistente\??)/.test(t);
-}
-function querDieta(t){ return /(dieta|cardapio|card[aá]pio|plano alimentar)/i.test(t||''); }
-function extrairNumeroG(t){ const m=(t||'').match(/(\d+)\s*g\b/i); return m?Number(m[1]):null; }
-function extrairNumeroKcal(t){ const m=(t||'').match(/(\d+)\s*k?cal\b/i); return m?Number(m[1]):null; }
-function extrairUnidades(t){ const m=(t||'').match(/(\d+)\s*(un|unid|unidade|fatias?|peda[cç]os?)/i); return m?Number(m[1]):null; }
-function extrairML(t){ const m=(t||'').match(/(\d+)\s*ml\b/i); return m?Number(m[1]):null; }
+  // por unidade
+  { key: /(ovo( frito)?)/i, base: '1un', kcal: 90 },
+  { key: /(pastel de carne)/i, base: '1un', kcal: 300 },
+];
 
-/* ============================================
-   MINI BANCO DE DADOS DE ALIMENTOS (BR) — base
-   kcal_por_100g e médias de porção padrão
-   ============================================ */
-const FOOD_DB = {
-  // densidades (g/ml) aproximadas
-  _density: {
-    'agua': 1.0,
-    'suco': 1.0,
-    'salada de frutas': 0.90,
-    'iogurte': 1.05,
-    'sopa': 1.02
-  },
-  // kcal por 100g (médias brasileiras)
-  'salada de frutas': { kcal100: 55, notes: 'Sem calda/açúcar. Com mel/calda pode subir ~20–40%.' },
-  'arroz cozido':     { kcal100: 128 },
-  'feijao cozido':    { kcal100: 76 },
-  'frango grelhado':  { kcal100: 165, prot100: 31 },
-  'ovo cozido':       { kcal100: 155, prot100: 13 },
-  'banana prata':     { kcal100: 95, porcao: { unidade: 80 } },  // 1 un ~80g
-  'maca':             { kcal100: 52, porcao: { unidade: 130 } },
-  'paes: pao frances':{ kcal100: 270, porcao: { unidade: 50 } }, // 1 pão ~50g
-  'pao frances':      { kcal100: 270, porcao: { unidade: 50 } },
-  'pastel de carne':  { faixa: [260, 420], porcao: { unidade: 120 }, notes: 'Varia por tamanho e óleo da fritura.' },
-  'coxinha':          { faixa: [180, 350], porcao: { unidade: 100 } },
-  'pizza mussarela':  { faixaFatias: [230, 320], notes: 'Por fatia média (1/8 de 35cm).' },
-  'pizza calabresa':  { faixaFatias: [250, 340] },
-  'iogurte natural':  { kcal100: 65, dens: 'iogurte' },
-  'leite integral':   { kcal100: 61, dens: 'agua' }
+// Conversões simples
+const parseNumber = (s) => {
+  if (!s) return null;
+  const n = Number(String(s).replace(',', '.'));
+  return Number.isFinite(n) ? n : null;
 };
 
-/* ===================================================
-   PARSER DE ITENS + ESTIMADOR DE CALORIAS (ml/g/un)
-   =================================================== */
-function guessFoodKey(text){
-  const t = norm(text);
-  const keys = Object.keys(FOOD_DB).filter(k=>!k.startsWith('_'));
-  // tenta match direto
-  for (const k of keys){ if (t.includes(norm(k))) return k; }
-  // sinônimos comuns
-  if (t.includes('salada de fruta')) return 'salada de frutas';
-  if (t.includes('arroz')) return 'arroz cozido';
-  if (t.includes('feijao')) return 'feijao cozido';
-  if (t.includes('frango')) return 'frango grelhado';
-  if (t.includes('ovo')) return 'ovo cozido';
-  if (t.includes('banana')) return 'banana prata';
-  if (t.includes('maca')) return 'maca';
-  if (t.includes('pao frances') || t.includes('pao ')) return 'pao frances';
-  if (t.includes('pastel')) return 'pastel de carne';
-  if (t.includes('coxinha')) return 'coxinha';
-  if (t.includes('pizza') && t.includes('muss')) return 'pizza mussarela';
-  if (t.includes('pizza') && t.includes('calab')) return 'pizza calabresa';
-  if (t.includes('iogurte')) return 'iogurte natural';
-  if (t.includes('leite')) return 'leite integral';
-  return null;
-}
+// Estima kcal a partir de texto
+function estimateCalories(text) {
+  const parts = [];
 
-function mlToGr(key, ml){
-  // densidade específica se houver
-  const item = FOOD_DB[key];
-  let densKey = item?.dens || key;
-  const dens = FOOD_DB._density[densKey] ?? 1.0;
-  return Math.round(ml * dens);
-}
+  // Quebra frases por " e ", "," etc.
+  const chunks = String(text).split(/(?:\se\s|,|\+|\s\+\s)/i).map(s => s.trim()).filter(Boolean);
 
-function formatKcal(k){
-  return `${Math.round(k)} kcal`;
-}
+  for (const chunk of chunks) {
+    let matched = false;
 
-function estimateCalories(text){
-  const key = guessFoodKey(text);
-  if (!key) return null;
+    for (const f of FOOD_DB) {
+      if (f.key.test(chunk)) {
+        matched = true;
 
-  const item = FOOD_DB[key];
-  const ml = extrairML(text);
-  const g  = extrairNumeroG(text);
-  const un = extrairUnidades(text);
+        // quantidade em g/ml/unidade
+        // procura padrão "100g", "150 g", "400ml", "2 ovos", "1 ovo"
+        let qtyG = null, qtyMl = null, qtyUn = null;
 
-  // pizza por fatia
-  if (item.faixaFatias) {
-    const q = un || 1;
-    const [min,max] = item.faixaFatias;
-    return {
-      title: `${q} fatia(s) de ${key}`,
-      kcalText: `${formatKcal(q*min)} ~ ${formatKcal(q*max)}`,
-      notes: item.notes || 'Varia com tamanho e cobertura.'
-    };
-  }
+        const mG = chunk.match(/(\d+(?:[.,]\d+)?)\s*(g|gramas?)/i);
+        const mMl = chunk.match(/(\d+(?:[.,]\d+)?)\s*(ml|mL)/i);
+        const mUn = chunk.match(/(\d+(?:[.,]\d+)?)\s*(un|uni|unid|unidade|ovos?|past[eé]is)/i);
 
-  // por unidade com faixa (pastel/coxinha)
-  if (item.faixa && item.porcao?.unidade) {
-    const q = un || 1;
-    const [min,max] = item.faixa;
-    return {
-      title: `${q} un de ${key}`,
-      kcalText: `${formatKcal(q*min)} ~ ${formatKcal(q*max)}`,
-      notes: item.notes || 'Receitas e tamanhos variam.'
-    };
-  }
+        if (mG) qtyG = parseNumber(mG[1]);
+        if (mMl) qtyMl = parseNumber(mMl[1]);
+        if (mUn) qtyUn = parseNumber(mUn[1]);
 
-  // com volume declarado
-  if (ml) {
-    const grams = mlToGr(key, ml);
-    if (item.kcal100){
-      const kcal = grams * item.kcal100 / 100;
-      return {
-        title: `${ml} ml de ${key} (~${grams} g)`,
-        kcalText: formatKcal(kcal),
-        notes: item.notes || null
-      };
+        // heurística: 1 ml ≈ 1 g para salada de frutas / líquidos
+        if (!qtyG && qtyMl) qtyG = qtyMl;
+
+        let kcal = 0;
+        let labelQty = '';
+
+        if (f.base === '100g') {
+          const q = qtyG ?? 100; // se não informado, assume 100g
+          kcal = (q / 100) * f.kcal;
+          labelQty = `${q}g`;
+        } else if (f.base === '1un') {
+          const q = qtyUn ?? 1;
+          kcal = q * f.kcal;
+          labelQty = `${q} un`;
+        }
+
+        parts.push({
+          desc: `${chunk} (${labelQty})`,
+          kcal: Math.round(kcal),
+        });
+        break;
+      }
+    }
+
+    // não casou nada conhecido: ignora para a soma, o GPT pode responder separadamente
+    if (!matched) {
+      // noop
     }
   }
 
-  // com gramas declarados
-  if (g) {
-    if (item.kcal100){
-      const kcal = g * item.kcal100 / 100;
-      return {
-        title: `${g} g de ${key}`,
-        kcalText: formatKcal(kcal),
-        notes: item.notes || null
-      };
-    }
-  }
-
-  // por unidade simples
-  if (un && item.porcao?.unidade && item.kcal100){
-    const grams = un * item.porcao.unidade;
-    const kcal = grams * item.kcal100 / 100;
-    return {
-      title: `${un} un de ${key} (~${grams} g)`,
-      kcalText: formatKcal(kcal),
-      notes: item.notes || null
-    };
-  }
-
-  // 1 unidade default se houver porção
-  if (item.porcao?.unidade && item.kcal100){
-    const grams = item.porcao.unidade;
-    const kcal = grams * item.kcal100 / 100;
-    return {
-      title: `1 un de ${key} (~${grams} g)`,
-      kcalText: formatKcal(kcal),
-      notes: item.notes || null
-    };
-  }
-
-  return null;
+  return parts;
 }
 
-/* ===========================
-   ENVIO VIA 360DIALOG v2
-   =========================== */
+// --- Envio via 360dialog v2 ---
 async function sendText(to, body) {
   const payload = {
     messaging_product: 'whatsapp',
     recipient_type: 'individual',
     to: String(to),
     type: 'text',
-    text: { body: String(body) }
+    text: { body: String(body).slice(0, 4096) }
   };
+
   try {
     const resp = await fetch('https://waba-v2.360dialog.io/messages', {
       method: 'POST',
@@ -223,135 +124,146 @@ async function sendText(to, body) {
       },
       body: JSON.stringify(payload)
     });
-    const text = await resp.text();
-    console.log(`➡️  360 status: ${resp.status} body: ${text}`);
+
+    const txt = await resp.text();
+    console.log(`➡️  360 status: ${resp.status} body: ${txt}`);
+    return { status: resp.status, body: txt };
   } catch (err) {
-    console.error('❌ 360dialog:', err);
+    console.error('❌ Erro 360:', err);
+    return { error: String(err) };
   }
 }
 
-/* ===========================
-   OPENAI (fallback conversa)
-   =========================== */
-async function chatOpenAI(prompt, perfil) {
-  const body = {
-    model: OPENAI_MODEL,
-    temperature: 0.6,
-    max_tokens: 500,
-    messages: [
-      {
-        role: 'system',
-        content: `
-Você é a Kali, assistente do Dr. Henrique (nutrologia).
-TOM: leve, direto, simpático, objetivo e sem assinatura.
-Responda como WhatsApp, frases curtas quando possível.
-Perfil do paciente: ${JSON.stringify(perfil)}
-`.trim()
-      },
-      { role: 'user', content: prompt }
-    ]
-  };
-
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  });
-
-  const data = await response.json();
-  return data?.choices?.[0]?.message?.content?.trim() || 'Não peguei. Pode reformular rapidinho?';
+// --- Auxiliar de sessão ---
+function getSession(wa_id) {
+  const d = todayStr();
+  const s = sessions[wa_id];
+  if (!s || s.date !== d) {
+    sessions[wa_id] = { date: d, items: [], total: 0 };
+  }
+  return sessions[wa_id];
 }
 
-/* ================
-   HEALTH CHECK
-   ================ */
-app.get('/', (_, res) => res.send('✅ Kali Nutro IA online'));
+function addItems(wa_id, items) {
+  const s = getSession(wa_id);
+  for (const it of items) {
+    s.items.push(it);
+    s.total += it.kcal;
+  }
+  s.total = Math.round(s.total);
+  return s;
+}
 
-/* ================
-   WEBHOOK 360
-   ================ */
+function summarize(wa_id) {
+  const s = getSession(wa_id);
+  if (!s.items.length) return 'Ainda não registrei nada hoje. Me diga o que você comeu (ex: "2 ovos e 100g de arroz").';
+  const lines = s.items.map(it => `• ${it.desc}: ${it.kcal} kcal`);
+  lines.push(`\nSubtotal do dia: ${s.total} kcal`);
+  return lines.join('\n');
+}
+
+// --- Healthcheck ---
+app.get('/', (req, res) => res.send('✅ Kali Nutro IA ativa (nutrição + soma de calorias)'));
+
+// --- Webhook ---
 app.post('/webhook', async (req, res) => {
   try {
+    console.log('🟦 Webhook recebido');
+    // responde rápido
     res.status(200).send('OK');
+
     const value = req.body?.entry?.[0]?.changes?.[0]?.value;
     const msg = value?.messages?.[0];
-    if (!msg || msg.type !== 'text') return;
+    if (!msg) return;
 
     const from = msg.from;
-    const text = (msg.text?.body || '').trim();
-    console.log(`💬 ${from}: ${text}`);
+    const type = msg.type;
 
-    const user = getUser(from);
-    const perfil = user.profile;
+    console.log(`💬 de ${from}: tipo=${type}`);
 
-    // apresentação: só 1ª vez ou se perguntarem
-    if ((quickGreeting(text) && !user.introduced) || isIdentityQuestion(text)) {
-      await sendText(from, KALI_INTRO);
-      user.introduced = true;
+    if (type !== 'text' || !msg.text?.body) {
+      await sendText(from, 'Posso te ajudar registrando refeições e somando calorias. Me diga o que você comeu. 🙂');
       return;
     }
 
-    // modo DIETA personalizada
-    if (querDieta(text)) {
-      if (!perfil.objetivo) { perfil.objetivo = null; await sendText(from,'Qual seu objetivo agora? (emagrecer, manter, ganhar massa)'); return; }
-      if (!perfil.kcalMeta) { const kcal=extrairNumeroKcal(text); if(!kcal){ await sendText(from,'Quantas kcal por dia? (ex: 1600 kcal)'); return;} perfil.kcalMeta=kcal; }
-      if (!perfil.proteinaMeta){ const g=extrairNumeroG(text); if(!g){ await sendText(from,'Meta de proteína? (ex: 150 g/dia)'); return;} perfil.proteinaMeta=g; }
-      if (!perfil.gosta.length){ perfil.gosta.push(text); await sendText(from,'Me diga 3–5 alimentos que você gosta e costuma comer.'); return; }
+    const text = msg.text.body.trim();
 
-      await sendText(from,'Fechado! Vou montar um dia de cardápio pra você…');
-      const prompt = `Monte um cardápio de 1 dia (café, almoço, lanche, jantar) com base:
-Objetivo: ${perfil.objetivo}
-Kcal: ${perfil.kcalMeta}
-Proteína: ${perfil.proteinaMeta}g
-Gosta: ${perfil.gosta.join(', ')}
-Evitar: ${perfil.naoGosta.join(', ')}
-Alergias: ${perfil.alergias.join(', ')}
-Traga quantidades e alternativas rápidas de mercado.`;
-      const plan = await chatOpenAI(prompt, perfil);
-      await sendText(from, plan);
+    // Comandos rápidos
+    if (/^(resumo|total|como estou)\b/i.test(text)) {
+      return void (await sendText(from, summarize(from)));
+    }
+    if (/^(zerar|reset|apagar)\b/i.test(text)) {
+      sessions[from] = { date: todayStr(), items: [], total: 0 };
+      return void (await sendText(from, 'Ok! Zerado para hoje. Me diga sua próxima refeição. 😉'));
+    }
+    if (/^(fechar dia|finalizar dia)\b/i.test(text)) {
+      const s = getSession(from);
+      const final = summarize(from);
+      sessions[from] = { date: todayStr(), items: [], total: 0 };
+      return void (await sendText(from, `Fechando o dia:\n${final}\n\nDia reiniciado. 🌙➡️🌞`));
+    }
+
+    // Estimativa e soma de calorias (regra local)
+    const items = estimateCalories(text);
+    if (items.length) {
+      const s = addItems(from, items);
+      const linhas = items.map(it => `• ${it.desc}: ${it.kcal} kcal`).join('\n');
+      await sendText(
+        from,
+        `${linhas}\n\nSubtotal do dia: ${s.total} kcal\n(Diga "resumo" para ver tudo, ou continue mandando o que comeu.)`
+      );
       return;
     }
 
-    // PRIMEIRO: tentar estimar calorias localmente
-    const est = estimateCalories(text);
-    if (est) {
-      let msgOut = `≈ ${est.kcalText} — ${est.title}`;
-      if (est.notes) msgOut += `\nObs.: ${est.notes}`;
-      // dica extra inteligente
-      if (norm(est.title).includes('salada de frutas')) {
-        msgOut += `\nQuer que eu some no seu dia? Me diga também o que mais comeu.`;
+    // Dúvidas gerais (nutrição/treino/medicação) — via OpenAI com guarda de escopo
+    if (OPENAI_API_KEY) {
+      const completion = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gpt-4o-mini',
+          temperature: 0.3,
+          max_tokens: 300,
+          messages: [
+            {
+              role: 'system',
+              content:
+                "Você é a Kali, assistente do Dr. Henrique. Tom: leve, direta e prática. Limites: só responda sobre nutrição, treino ou medicação relacionada a emagrecimento/saúde metabólica. Se o assunto não for desses, responda: 'Posso te ajudar com nutrição, treino e medicamentos. Quer falar sobre sua alimentação de hoje?'. Quando o usuário citar alimentos/quantidades, seja objetiva e peça unidade se faltar (g, ml, unidade). Não assine, não use rodapé."
+            },
+            { role: 'user', content: text }
+          ]
+        })
+      });
+
+      if (completion.ok) {
+        const data = await completion.json();
+        const out = data?.choices?.[0]?.message?.content?.trim();
+        if (out) return void (await sendText(from, out));
       }
-      await sendText(from, msgOut);
-      return;
+
+      // fallback
+      return void (await sendText(from, 'Posso te ajudar com nutrição, treino e medicamentos. Me diga o que você comeu que eu somo por aqui. 🙂'));
+    } else {
+      return void (await sendText(from, 'Me diga o que você comeu (ex: "1 ovo e 150g de arroz") que eu somo as calorias. 😉'));
     }
-
-    // FALLBACK: conversa livre
-    const answer = await chatOpenAI(text, perfil);
-    await sendText(from, answer);
-
   } catch (err) {
-    console.error('🔥 Webhook error:', err);
-    try { res.status(500).send('erro'); } catch {}
+    console.error('🔥 Erro no /webhook:', err);
+    try { res.status(200).end(); } catch {}
   }
 });
 
-/* ==================
-   ENVIO MANUAL /send
-   ================== */
+// Envio manual
 app.post('/send', async (req, res) => {
   const { to, body } = req.body || {};
   if (!to || !body) return res.status(400).json({ error: 'to e body obrigatórios' });
-  await sendText(to, body);
-  res.send('ok');
+  const r = await sendText(to, body);
+  res.json(r);
 });
 
-/* ========
-   LISTEN
-   ======== */
 app.listen(PORT, () => {
-  console.log(`🚀 Kali Nutro IA rodando na porta ${PORT}`);
-  console.log(`🧠 Modelo OpenAI: ${OPENAI_MODEL}`);
+  console.log(`🚀 Kali Nutro IA ativa na porta ${PORT}`);
+  console.log(`🔔 Endpoint 360: https://waba-v2.360dialog.io/messages`);
 });
