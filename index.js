@@ -1,8 +1,8 @@
-// index.js — ES Module
+// index.js — versão estável (ESM completa e corrigida)
+
 import express from 'express';
 import dotenv from 'dotenv';
 import process from 'process';
-import aiReply from './brain.js'; // <-- usa export default, sem chaves
 
 dotenv.config();
 
@@ -10,11 +10,18 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
-const D360_API_KEY = process.env.D360_API_KEY;
+const D360_API_KEY = process.env.D360_API_KEY; // chave do número (Numbers -> Show API Key)
 
-// --- 360 v2: envio de texto ---
+if (!D360_API_KEY) {
+  console.warn('⚠️ D360_API_KEY não configurado — defina no Railway / Variables');
+}
+
+/**
+ * Envia texto via 360dialog v2
+ */
 async function sendText(to, body) {
   const payload = {
+    messaging_product: 'whatsapp',       // ⚠️ obrigatório
     recipient_type: 'individual',
     to: String(to),
     type: 'text',
@@ -25,65 +32,84 @@ async function sendText(to, body) {
     const resp = await fetch('https://waba-v2.360dialog.io/messages', {
       method: 'POST',
       headers: {
-        'D360-API-KEY': D360_API_KEY || '',
+        'D360-API-KEY': D360_API_KEY,
         'Content-Type': 'application/json',
         'Accept': 'application/json'
       },
       body: JSON.stringify(payload)
     });
-    const txt = await resp.text();
-    console.log(`➡️  360 status: ${resp.status} body: ${txt}`);
-    return { status: resp.status, body: txt };
-  } catch (e) {
-    console.error('❌ Erro ao chamar 360:', e);
-    return { status: 0, body: String(e) };
+
+    const respText = await resp.text();
+    console.log(`➡️  360 status: ${resp.status} body: ${respText}`);
+    return { status: resp.status, body: respText };
+  } catch (err) {
+    console.error('❌ Erro ao chamar 360dialog:', err);
+    throw err;
   }
 }
 
-app.get('/', (_req, res) => res.send('Kali Nutro IA estável'));
+/**
+ * Health check
+ */
+app.get('/', (req, res) => {
+  res.send('✅ Kali Nutro IA estável rodando');
+});
 
+/**
+ * Webhook (recebe mensagens do WhatsApp)
+ */
 app.post('/webhook', async (req, res) => {
   try {
     console.log('🟦 Webhook recebido');
     console.log('↩️ body:', JSON.stringify(req.body));
+
+    // Responde rápido ao 360
     res.status(200).send('OK');
 
-    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    const from = msg?.from;
-    const type = msg?.type;
-    if (!from || !type) return;
+    const entry = req.body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const messages = value?.messages;
 
-    console.log(`💬 de ${from}: tipo=${type}`);
-
-    if (type !== 'text') {
-      await sendText(from, 'Recebi sua mensagem 👍');
+    if (!messages || !Array.isArray(messages)) {
+      console.log('⚠️ Nenhuma mensagem processável encontrada.');
       return;
     }
 
-    const textIn = msg.text?.body || '';
-    console.log(`📥 recebido: ${textIn}`);
+    for (const msg of messages) {
+      const from = msg.from;
+      const type = msg.type;
 
-    let out = null;
-    try {
-      const name = req.body?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name || 'Paciente';
-      out = await aiReply(from, textIn, name);
-    } catch (e) {
-      console.error('⚠️ Falha aiReply:', e);
+      console.log(`💬 de ${from}: tipo=${type}`);
+
+      if (type === 'text' && msg.text?.body) {
+        const received = msg.text.body;
+        console.log(`📥 recebido: ${received}`);
+
+        await sendText(from, `Recebi: ${received} ✅`);
+      } else {
+        await sendText(from, 'Recebi sua mensagem. Obrigado! 🙏');
+      }
     }
-
-    if (!out || typeof out !== 'string') out = `Recebi: ${textIn} ✅`;
-    await sendText(from, out);
   } catch (err) {
-    console.error('Erro no /webhook:', err);
-    try { res.status(200).end(); } catch {}
+    console.error('🔥 Erro no /webhook:', err);
+    try { res.status(500).send('erro'); } catch {}
   }
 });
 
+/**
+ * Envio manual via POST /send
+ */
 app.post('/send', async (req, res) => {
   const { to, body } = req.body || {};
   if (!to || !body) return res.status(400).json({ error: 'to e body obrigatórios' });
-  const resp = await sendText(to, body);
-  res.json(resp);
+
+  try {
+    const resp = await sendText(to, body);
+    res.json(resp);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 app.listen(PORT, () => {
