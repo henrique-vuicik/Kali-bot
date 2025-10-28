@@ -1,4 +1,4 @@
-// index.js — Kali Nutro IA (estável com 360 v2 + OpenAI atual)
+// index.js — Kali em modo conversa livre (nutrição, treino e medicações), tom leve e objetivo
 
 import express from 'express';
 import dotenv from 'dotenv';
@@ -11,16 +11,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 8080;
 const D360_API_KEY = process.env.D360_API_KEY?.trim();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
+const OPENAI_MODEL = process.env.OPENAI_MODEL?.trim() || 'gpt-4o-mini'; // permite trocar o modelo por variável
 
+// Avisos de variáveis
 if (!D360_API_KEY) console.warn('⚠️ D360_API_KEY não configurado — defina no Railway / Variables');
 if (!OPENAI_API_KEY) console.warn('⚠️ OPENAI_API_KEY não configurado — defina no Railway / Variables');
-
-/** Util: loga e retorna corpo puro da resposta */
-async function readBody(resp) {
-  const text = await resp.text();
-  console.log(`➡️ 360 status: ${resp.status} body: ${text}`);
-  return text;
-}
 
 /** Envia texto via 360dialog v2 */
 async function sendText(to, body) {
@@ -42,21 +37,18 @@ async function sendText(to, body) {
       },
       body: JSON.stringify(payload)
     });
-    const raw = await readBody(resp);
-    if (!resp.ok) {
-      // Se acusar "messaging_product is required", mostre o payload no log.
-      console.error('📦 Payload enviado à 360:', JSON.stringify(payload));
-    }
-    return { status: resp.status, body: raw };
+    const respText = await resp.text();
+    console.log(`➡️  360 status: ${resp.status} body: ${respText}`);
+    return { status: resp.status, body: respText };
   } catch (err) {
     console.error('❌ Erro ao chamar 360dialog:', err);
-    return { error: String(err) };
+    return { error: err.message };
   }
 }
 
 /** Health check */
-app.get('/', (_req, res) => {
-  res.send('✅ Kali Nutro IA com OpenAI estável rodando');
+app.get('/', (req, res) => {
+  res.send('✅ Kali Nutro IA estável rodando (conversa livre)');
 });
 
 /** Webhook (recebe mensagens do WhatsApp) */
@@ -64,76 +56,98 @@ app.post('/webhook', async (req, res) => {
   try {
     console.log('🟦 Webhook recebido');
     console.log('↩️ body:', JSON.stringify(req.body));
-    res.status(200).send('OK'); // responde rápido
+    // responde rápido ao 360
+    res.status(200).send('OK');
 
-    const msg = req.body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-    if (!msg) {
+    const entry = req.body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value;
+    const messages = value?.messages;
+
+    if (!Array.isArray(messages) || messages.length === 0) {
       console.log('⚠️ Nenhuma mensagem processável encontrada.');
       return;
     }
 
-    const from = msg.from;
-    const type = msg.type;
-    console.log(`💬 de ${from}: tipo=${type}`);
+    for (const msg of messages) {
+      const from = msg.from;
+      const type = msg.type;
+      console.log(`💬 de ${from}: tipo=${type}`);
 
-    if (type === 'text' && msg.text?.body) {
-      const userText = msg.text.body;
-      console.log(`📥 recebido: ${userText}`);
+      // Apenas texto por enquanto
+      if (type === 'text' && msg.text?.body) {
+        const userText = String(msg.text.body || '').trim();
+        console.log(`📥 recebido: ${userText}`);
 
-      // -------- OpenAI (chat.completions) --------
-      try {
-        const response = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model: 'gpt-4o-mini',
-            messages: [
-              {
-                role: 'system',
-                content:
-                  'Você é um nutricionista especializado. Forneça informações precisas sobre calorias e nutrientes em alimentos comuns no Brasil. Responda em português com até 80 palavras. Assine como "Dr. Henrique Vuicik - CRM-PR 28088".'
-              },
-              {
-                role: 'user',
-                content: `Quantas calorias tem ${userText}? Quais são seus principais nutrientes?`
-              }
-            ],
-            temperature: 0.5,
-            max_tokens: 220
-          })
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          console.error('❌ Erro OpenAI:', response.status, errorText);
-          await sendText(from, 'Desculpe, houve um erro ao consultar a IA. Verifique a chave e o uso da OpenAI.');
-          return;
+        // Respostas curtinhas para saudações simples (economiza tokens e é mais ágil)
+        const t = userText.toLowerCase();
+        if (['oi','olá','ola','bom dia','boa tarde','boa noite'].some(s => t.startsWith(s))) {
+          await sendText(from, 'Oi! Sou a Kali. Pode mandar dúvidas de nutrição, treino ou medicações 😉');
+          continue;
         }
 
-        const data = await response.json();
-        const aiResponse = data?.choices?.[0]?.message?.content?.trim();
+        // Chamada à OpenAI — conversa livre
+        try {
+          const response = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${OPENAI_API_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              model: OPENAI_MODEL,
+              messages: [
+                {
+                  role: 'system',
+                  content: `
+Você é a **Kali**, assistente de nutrição e saúde do consultório.
+Estilo: WhatsApp — simples, breve, amigável, sem formalidade e **sem assinatura**.
+Objetivo: responder dúvidas sobre alimentação, calorias, composição nutricional, estratégias de treino,
+rotina de exercícios, sono, hidratação e também medicações/fitoterápicos relacionados à saúde e peso.
+Diretrizes:
+- Seja objetiva (2–5 frases curtas). Se a dúvida pedir números, dê faixas típicas e exemplos práticos.
+- Evite jargões; explique em linguagem comum. Pode usar emojis com moderação (😉, ✅, ⚠️, 🍽️, 🏋️).
+- Não faça diagnóstico nem prescrição. Em temas de medicação, traga informações gerais (mecanismo, efeitos comuns,
+  riscos, interações frequentes) e **recomende avaliação médica** quando necessário.
+- Quando o usuário citar um alimento, se possível traga kcal aproximada por porção comum e dicas de troca/porção.
+- Se a pergunta for ampla, ofereça 2–3 caminhos práticos (ex.: “por onde começar”).
+- Nunca assine como médico, não cite CRM, não use tom burocrático.
+                `.trim()
+                },
+                { role: 'user', content: userText }
+              ],
+              temperature: 0.6,
+              max_tokens: 260
+            })
+          });
 
-        if (aiResponse) {
-          await sendText(from, aiResponse);
-        } else {
-          await sendText(from, 'Não consegui obter os dados desse alimento. Tente especificar: ex. "100g de arroz cozido".');
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Erro OpenAI:', response.status, errorText);
+            await sendText(from, 'Tive um problema aqui com a IA. Pode tentar de novo em instantes? 🙏');
+            continue;
+          }
+
+          const data = await response.json();
+          const aiMsg = data?.choices?.[0]?.message?.content?.trim();
+
+          if (aiMsg) {
+            await sendText(from, aiMsg);
+          } else {
+            await sendText(from, 'Não consegui entender bem. Pode reformular em uma frase? 😊');
+          }
+        } catch (openaiError) {
+          console.error('💥 Erro fatal OpenAI:', openaiError);
+          if (!OPENAI_API_KEY) {
+            await sendText(from, 'Erro: chave da IA não configurada. (admin) Verifique OPENAI_API_KEY no Railway.');
+          } else {
+            await sendText(from, 'Deu uma oscilação aqui. Tenta novamente já já, por favor 🙏');
+          }
         }
-      } catch (openaiError) {
-        console.error('💥 Erro fatal OpenAI:', openaiError);
-        if (!OPENAI_API_KEY) {
-          await sendText(from, 'Erro: OPENAI_API_KEY não configurada no Railway.');
-        } else if (OPENAI_API_KEY.length < 10) {
-          await sendText(from, 'Erro: OPENAI_API_KEY parece inválida. Verifique no Railway.');
-        } else {
-          await sendText(from, 'Sistema temporariamente indisponível. Tente novamente em instantes.');
-        }
+      } else {
+        // Tipos não-texto
+        await sendText(from, 'Recebi! Se puder, me manda em texto o que você precisa 😉');
       }
-      // -------------------------------------------
-    } else {
-      await sendText(from, 'Recebi sua mensagem. Obrigado! 🙏');
     }
   } catch (err) {
     console.error('🔥 Erro no /webhook:', err);
@@ -141,7 +155,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-/** Envio manual */
+/** Envio manual via POST /send (teste rápido) */
 app.post('/send', async (req, res) => {
   const { to, body } = req.body || {};
   if (!to || !body) return res.status(400).json({ error: 'to e body obrigatórios' });
@@ -154,6 +168,7 @@ app.post('/send', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Kali Nutro IA com OpenAI estável rodando na porta ${PORT}`);
+  console.log(`🚀 Kali Nutro IA estável rodando na porta ${PORT}`);
   console.log(`🔔 Endpoint 360: https://waba-v2.360dialog.io/messages`);
+  console.log(`🧠 Modelo OpenAI: ${OPENAI_MODEL}`);
 });
