@@ -1,49 +1,56 @@
 // brain.js — ES Module
-import OpenAI from "openai";
+import OpenAI from 'openai';
 
-const apiKey = process.env.OPENAI_API_KEY;
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
-// Cria cliente só se houver chave; caso contrário, cai em modo “eco”
-const client = apiKey ? new OpenAI({ apiKey }) : null;
+// memória ingênua por usuário em RAM
+const memory = new Map();
+function getHistory(id) { return memory.get(id) || []; }
+function pushMemory(id, role, content) {
+  const arr = getHistory(id);
+  arr.push({ role, content });
+  while (arr.length > 12) arr.shift();
+  memory.set(id, arr);
+}
 
-/**
- * Gera resposta inteligente para a mensagem de texto recebida.
- * Se não houver OPENAI_API_KEY, responde em modo fallback.
- */
-export async function thinkReply(userText) {
-  const prompt = String(userText || "").trim();
+function sys(name='Paciente') {
+  return [
+    'Você é a Kali, assistente de nutrologia do Dr. Henrique Vuicik.',
+    'Fale em português, breve, empática e orientativa.',
+    'Evite diagnósticos fechados; priorize educação e segurança.',
+    'Para casos clínicos, sugira avaliação com o médico.',
+    `O usuário chama-se ${name}.`
+  ].join(' ');
+}
 
-  if (!prompt) {
-    return "Recebi sua mensagem. Como posso ajudar?";
+export async function aiReply(wa_id, userText, profileName='Paciente') {
+  // sem chave? devolve resposta simples para não quebrar
+  if (!process.env.OPENAI_API_KEY) {
+    return 'Oi! Sou a Kali 😊. Posso ajudar com nutrologia e hábitos. Conte-me sua dúvida.';
   }
 
-  // Fallback quando não há chave configurada
-  if (!client) {
-    return `Você disse: "${prompt}". (Modo simples ativo — configure a OPENAI_API_KEY para respostas inteligentes)`;
-  }
+  pushMemory(wa_id, 'user', userText);
 
-  // ====== MODELO INTELIGENTE ======
-  // Ajuste o nome do modelo se quiser; este funciona com a lib v4.x
-  const system = "Você é a Kali Nutro IA. Responda de forma curta, simpática e útil.";
-  const user = `Mensagem do usuário (WhatsApp): ${prompt}`;
+  const messages = [
+    { role: 'system', content: sys(profileName) },
+    ...getHistory(wa_id).map(m => ({ role: m.role, content: m.content }))
+  ];
 
   try {
-    const completion = await client.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: user }
-      ],
-      temperature: 0.4,
-      max_tokens: 160
+    const resp = await client.chat.completions.create({
+      model: OPENAI_MODEL,
+      messages,
+      max_tokens: 300,
+      temperature: 0.5
     });
-
     const text =
-      completion?.choices?.[0]?.message?.content?.trim() ||
-      "Certo! Como posso ajudar?";
+      resp.choices?.[0]?.message?.content?.trim() ||
+      'Entendi! Como posso te ajudar?';
+    pushMemory(wa_id, 'assistant', text);
     return text;
-  } catch (err) {
-    console.error("Erro na IA:", err);
-    return "Tive um problema ao gerar a resposta agora. Pode tentar de novo?";
+  } catch (e) {
+    console.error('Erro na IA:', e);
+    return 'Tive um probleminha para pensar nisso agora 😅. Pode repetir em outras palavras?';
   }
 }
