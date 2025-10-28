@@ -9,8 +9,8 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 8080;
-const D360_API_KEY = process.env.D360_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const D360_API_KEY = process.env.D360_API_KEY?.trim();
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
 
 // Validações iniciais
 if (!D360_API_KEY) {
@@ -48,7 +48,7 @@ async function sendText(to, body) {
     return { status: resp.status, body: respText };
   } catch (err) {
     console.error('❌ Erro ao chamar 360dialog:', err);
-    throw err;
+    return { error: err.message };
   }
 }
 
@@ -90,20 +90,21 @@ app.post('/webhook', async (req, res) => {
         const received = msg.text.body;
         console.log(`📥 recebido: ${received}`);
 
-        // Resposta com OpenAI para informações nutricionais usando proxy
+        // Primeira tentativa de resposta com OpenAI
         try {
-          const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+          const response = await fetch('https://api.openai.com/v1/chat/completions', {
             method: 'POST',
             headers: {
               'Authorization': `Bearer ${OPENAI_API_KEY}`,
-              'Content-Type': 'application/json'
+              'Content-Type': 'application/json',
+              'OpenAI-Version': '2023-07-01'
             },
             body: JSON.stringify({
-              model: 'gpt-4-turbo',
+              model: 'gpt-3.5-turbo',
               messages: [
                 {
                   role: 'system',
-                  content: 'Você é um nutricionista especializado. Forneça informações precisas sobre calorias, macronutrientes e benefícios nutricionais de alimentos comuns no Brasil. Responda em português com até 80 palavras e inclua valor calórico quando possível. Assine como "Dr. Henrique Vuicik - CRM-PR 28088".'
+                  content: 'Você é um nutricionista especializado. Forneça informações precisas sobre calorias e nutrientes em alimentos comuns no Brasil. Responda em português com até 80 palavras. Assine como "Dr. Henrique Vuicik - CRM-PR 28088".'
                 },
                 {
                   role: 'user',
@@ -115,17 +116,34 @@ app.post('/webhook', async (req, res) => {
             })
           });
 
-          const data = await openaiResponse.json();
+          if (!response.ok) {
+            const errorText = await response.text();
+            console.error('❌ Erro OpenAI:', response.status, errorText);
+            
+            // Mensagem de erro direcionada
+            await sendText(from, 'Desculpe, a OpenAI retornou erro. Verifique sua chave API e limite de uso.');
+            return;
+          }
+
+          const data = await response.json();
           
           if (data.choices && data.choices.length > 0) {
             const aiResponse = data.choices[0].message.content;
             await sendText(from, aiResponse);
           } else {
-            await sendText(from, 'Desculpe, não consegui obter as informações nutricionais no momento.');
+            await sendText(from, 'Não consegui obter informações detalhadas sobre este alimento. Tente especificar melhor (ex: "100g de arroz cozido").');
           }
         } catch (openaiError) {
-          console.error("Erro OpenAI:", openaiError);
-          await sendText(from, "Desculpe, não consegui obter as informações nutricionais no momento. Tente novamente em instantes.");
+          console.error("💥 Erro fatal OpenAI:", openaiError);
+          
+          // Tentativa de diagnóstico da chave API
+          if (OPENAI_API_KEY && OPENAI_API_KEY.length < 10) {
+            await sendText(from, 'Erro: Chave API da OpenAI parece estar incorreta. Verifique no Railway.');
+          } else if (!OPENAI_API_KEY) {
+            await sendText(from, 'Erro: Chave API da OpenAI não configurada. Configure no Railway.');
+          } else {
+            await sendText(from, 'Sistema temporariamente indisponível. Tente novamente em instantes.');
+          }
         }
       } else {
         await sendText(from, 'Recebi sua mensagem. Obrigado! 🙏');
@@ -154,6 +172,6 @@ app.post('/send', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Kali Nutro IA com OpenAI estável rodando na porta ${PORT}`);
-  console.log(`🔔 Endpoint 360: https://waba-v2.360dialog.io/messages`);
-  console.log(`🧠 OpenAI integrada via API direta`);
+  console.log(`🔑 Chave OpenAI configurada: ${!!OPENAI_API_KEY}`);
+  console.log(`🧠 Sistema de nutrição ativo`);
 });
